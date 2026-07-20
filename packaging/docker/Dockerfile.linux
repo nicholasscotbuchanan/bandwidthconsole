@@ -1,0 +1,113 @@
+# Build image for the Linux console packages (.deb + .rpm) and the bwagent
+# packages. One image emits both formats for whichever architecture it is built
+# for; jpackage cannot cross-compile, so the *architecture* comes from the
+# build platform:
+#
+#   podman build --platform linux/arm64 -f packaging/docker/Dockerfile.linux -t bwtest-build:arm64 .
+#   podman build --platform linux/amd64 -f packaging/docker/Dockerfile.linux -t bwtest-build:amd64 .
+#
+# eclipse-temurin rather than a hand-rolled JDK install: it ships the jmods
+# jlink needs (some later Temurin builds dropped them), so there is no tarball
+# to pin or checksum.
+#
+# The tag is pinned on both axes, for two separate reasons.
+#
+# Not floating (:21-jdk): that resolves to Ubuntu 25, which ships uutils
+# coreutils — the Rust rewrite, whose `comm` *errors* on unsorted input where
+# GNU's merely warns. jpackage's generated %install scriptlet pipes sort into
+# comm, so on that base every rpm build dies with "file 1 is not in sorted order".
+#
+# Jammy (22.04) rather than noble (24.04): jpackage derives the .deb Depends
+# field by asking the *build host* which package owns each shared library the
+# app image links. On noble that yields Ubuntu-specific time_t-transition names
+# like libpng16-16t64, which do not exist on Debian 12 — the package then
+# refuses to install. Jammy predates that transition and yields libpng16-16,
+# which resolves on Debian and both Ubuntu LTSes.
+FROM eclipse-temurin:21-jdk-jammy
+
+# Byte ordering, so the sort and comm in that same scriptlet agree. Locale
+# collation orders '/' differently and reintroduces the failure another way.
+ENV LC_ALL=C
+ENV LANG=C
+
+# Every version is pinned so two builds of this image a month apart produce the
+# same toolchain. Bump deliberately, not by drifting.
+ARG JAVAFX_VERSION=23.0.1
+ARG NFPM_VERSION=2.41.1
+ARG ZIG_VERSION=0.13.0
+ARG RUST_VERSION=1.97.1
+ENV ZIG_VERSION=${ZIG_VERSION}
+
+# fakeroot/binutils/dpkg-dev are jpackage's .deb path; rpm is its .rpm path.
+# Both in one image so a single run produces both formats.
+# file and cpio are undeclared rpmbuild dependencies: it shells out to `file`
+# for automatic dependency generation and cpio for the payload, and fails in
+# %install without them.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        maven \
+        fakeroot binutils dpkg-dev rpm file cpio \
+        curl unzip ca-certificates \
+        build-essential pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# JavaFX jmods. 23.0.1 rather than a 21 LTS pair because Gluon publishes no
+# linux-aarch64 jmods before 23 — and arm64 is a required target. Verified to
+# jlink cleanly against this JDK 21 base.
+#
+# Gluon's URLs are per-arch and use their own arch spelling, hence the mapping.
+RUN set -eux; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) JFX_ARCH=x64 ;; \
+      arm64) JFX_ARCH=aarch64 ;; \
+      *) echo "unsupported architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/jfx.zip \
+      "https://download2.gluonhq.com/openjfx/${JAVAFX_VERSION}/openjfx-${JAVAFX_VERSION}_linux-${JFX_ARCH}_bin-jmods.zip"; \
+    unzip -q /tmp/jfx.zip -d /opt; \
+    rm /tmp/jfx.zip; \
+    mv "/opt/javafx-jmods-${JAVAFX_VERSION}" /opt/javafx-jmods; \
+    # Fail loudly now rather than producing a runtime with no JavaFX in it.
+    test -f /opt/javafx-jmods/javafx.controls.jmod
+ENV JAVAFX_JMODS=/opt/javafx-jmods
+
+# Rust, for the bwagent bundled into the console package and the standalone
+# agent packages. rustup rather than Debian's rust, which is too old.
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal \
+        --default-toolchain "${RUST_VERSION}"
+ENV PATH=/root/.cargo/bin:$PATH
+
+# zig + cargo-zigbuild, used only to pick the agent's glibc floor.
+#
+# A binary compiled normally in this image requires whatever glibc the base
+# has, which strands it on older distros — a bwagent built on 24.04 needs
+# GLIBC_2.39 and will not start on RHEL 9 (2.34) or Debian 12 (2.36). zig
+# ships its own glibc headers/stubs, so cargo-zigbuild can target an explicit
+# older version regardless of the build host. See GLIBC_FLOOR in common.sh.
+RUN set -eux; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) ZIG_ARCH=x86_64 ;; \
+      arm64) ZIG_ARCH=aarch64 ;; \
+    esac; \
+    curl -fsSL -o /tmp/zig.tar.xz \
+      "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"; \
+    mkdir -p /opt/zig; \
+    tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1; \
+    rm /tmp/zig.tar.xz; \
+    /opt/zig/zig version
+ENV PATH=/opt/zig:$PATH
+RUN cargo install cargo-zigbuild --locked && test -x /root/.cargo/bin/cargo-zigbuild
+
+# nfpm emits .deb and .rpm from one spec, so the agent packaging does not need
+# parallel debian/ and .spec trees.
+RUN set -eux; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) NFPM_ARCH=x86_64 ;; \
+      arm64) NFPM_ARCH=arm64 ;; \
+    esac; \
+    curl -fsSL -o /tmp/nfpm.tar.gz \
+      "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_${NFPM_ARCH}.tar.gz"; \
+    tar -xzf /tmp/nfpm.tar.gz -C /usr/local/bin nfpm; \
+    rm /tmp/nfpm.tar.gz; \
+    nfpm --version
+
+WORKDIR /src

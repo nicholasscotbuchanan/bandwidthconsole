@@ -1,6 +1,6 @@
 package com.bwtest.console.model;
 
-/** Source generation model — the core thing the tool compares. */
+/** Sender generation model — the core thing the tool compares. */
 public enum Architecture {
     THREADED("Threaded", "Threaded (blocking, 1 thread/conn)"),
     SELECTOR("Selector", "Selector (async reactor)");

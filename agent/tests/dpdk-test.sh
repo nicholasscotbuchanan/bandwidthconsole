@@ -22,11 +22,11 @@ PROTO=${1:-QuicDpdk}
 DUR=${DUR:-5}
 THREADS=${THREADS:-2}
 
-SINK_IP=10.99.0.2
-SRC_IP=10.99.0.1
+B_IP=10.99.0.2
+A_IP=10.99.0.1
 SOCK_DIR=/run/memif
 
-cleanup() { $CT rm -f bw-dpdk-console bw-dpdk-sink bw-dpdk-src >/dev/null 2>&1; }
+cleanup() { $CT rm -f bw-dpdk-console bw-dpdk-b bw-dpdk-a >/dev/null 2>&1; }
 trap cleanup EXIT
 cleanup
 $CT network create bwnet >/dev/null 2>&1
@@ -40,26 +40,26 @@ echo "== console =="
 $CT run -d --name bw-dpdk-console --network bwnet \
   -e SC_PROTO="$PROTO" -e SC_DUR="$DUR" -e SC_THREADS="$THREADS" -e AGENT_WAIT=90 \
   -e SC_PAYLOAD=1200 -e SC_SINGLECONN=1 \
-  -e SC_SOURCE_NAME=dpdk-src -e SC_SINK_NAME=dpdk-sink \
+  -e SC_FROM_NAME=dpdk-a -e SC_TO_NAME=dpdk-b \
   -w /t -v "$(cd "$(dirname "$0")" && pwd):/t:ro" \
   python:3-slim python3 /t/mock_console.py 9077 >/dev/null
 for i in $(seq 1 20); do $CT logs bw-dpdk-console 2>&1 | grep -q listening && break; sleep 1; done
 
-# Roles are pinned by name (SC_SOURCE_NAME/SC_SINK_NAME), so start order is free
+# Roles are pinned by name (SC_FROM_NAME/SC_TO_NAME), so start order is free
 # for the console -- but the memif SERVER must exist before the client dials it,
-# so the sink goes first. (The client also retries, so this is belt-and-braces.)
-echo "== sink agent (memif server, $SINK_IP) =="
-$CT run -d --name bw-dpdk-sink --network bwnet --privileged -v memifsock:$SOCK_DIR \
-  bwagent-dpdk --console bw-dpdk-console:9077 --name dpdk-sink --advertise bw-dpdk-sink \
-  --dpdk-ip $SINK_IP \
-  --dpdk-eal "bwagent -l 1 --no-huge -m 256 --no-pci --file-prefix=sink --vdev=net_memif0,role=server,id=0,bsize=16384,socket=$SOCK_DIR/memif.sock,socket-abstract=no" >/dev/null
+# so the receiver goes first. (The client also retries, so this is belt-and-braces.)
+echo "== receiver agent (memif server, $B_IP) =="
+$CT run -d --name bw-dpdk-b --network bwnet --privileged -v memifsock:$SOCK_DIR \
+  bwagent-dpdk --console bw-dpdk-console:9077 --name dpdk-b --advertise bw-dpdk-b \
+  --dpdk-ip $B_IP \
+  --dpdk-eal "bwagent -l 1 --no-huge -m 256 --no-pci --file-prefix=b --vdev=net_memif0,role=server,id=0,bsize=16384,socket=$SOCK_DIR/memif.sock,socket-abstract=no" >/dev/null
 sleep 3
 
-echo "== source agent (memif client, $SRC_IP) =="
-$CT run -d --name bw-dpdk-src --network bwnet --privileged -v memifsock:$SOCK_DIR \
-  bwagent-dpdk --console bw-dpdk-console:9077 --name dpdk-src --advertise bw-dpdk-src \
-  --dpdk-ip $SRC_IP \
-  --dpdk-eal "bwagent -l 0 --no-huge -m 256 --no-pci --file-prefix=src --vdev=net_memif0,role=client,id=0,bsize=16384,socket=$SOCK_DIR/memif.sock,socket-abstract=no" >/dev/null
+echo "== sender agent (memif client, $A_IP) =="
+$CT run -d --name bw-dpdk-a --network bwnet --privileged -v memifsock:$SOCK_DIR \
+  bwagent-dpdk --console bw-dpdk-console:9077 --name dpdk-a --advertise bw-dpdk-a \
+  --dpdk-ip $A_IP \
+  --dpdk-eal "bwagent -l 0 --no-huge -m 256 --no-pci --file-prefix=a --vdev=net_memif0,role=client,id=0,bsize=16384,socket=$SOCK_DIR/memif.sock,socket-abstract=no" >/dev/null
 
 echo "== waiting for run =="
 for i in $(seq 1 90); do
@@ -71,11 +71,11 @@ echo
 echo "=========== CONSOLE ==========="
 $CT logs bw-dpdk-console 2>&1 | tail -25
 echo
-echo "=========== SOURCE AGENT ==========="
-$CT logs bw-dpdk-src 2>&1 | grep -viE "^EAL: |TELEMETRY" | tail -12
+echo "=========== SENDING AGENT ==========="
+$CT logs bw-dpdk-a 2>&1 | grep -viE "^EAL: |TELEMETRY" | tail -12
 echo
-echo "=========== SINK AGENT ==========="
-$CT logs bw-dpdk-sink 2>&1 | grep -viE "^EAL: |TELEMETRY" | tail -12
+echo "=========== RECEIVING AGENT ==========="
+$CT logs bw-dpdk-b 2>&1 | grep -viE "^EAL: |TELEMETRY" | tail -12
 
 $CT logs bw-dpdk-console 2>&1 | grep -q "OK:" && { echo; echo "RESULT: PASS ($PROTO over real DPDK)"; exit 0; }
 echo; echo "RESULT: FAIL"; exit 1

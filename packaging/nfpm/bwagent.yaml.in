@@ -1,0 +1,50 @@
+# Template for the standalone bwagent nfpm spec.
+#
+# One spec emits both .deb and .rpm, so the two cannot drift apart the way
+# parallel debian/ and .spec trees do.
+#
+# This is a .in file because nfpm does not expand variables in contents.src —
+# neither ${VAR} nor Go-template {{ .Env.VAR }} (the latter is not even valid
+# YAML here). packaging/build-agent-packages.sh substitutes the placeholders
+# below and writes the rendered spec into the work directory.
+name: bwagent
+arch: ${PKG_ARCH}
+platform: linux
+version: ${PKG_VERSION}
+section: net
+priority: optional
+maintainer: Nicholas Buchanan <nicholas.scot.buchanan@gmail.com>
+description: |
+  Bandwidth test surface.
+  One binary for distributed bandwidth tests, orchestrated by the Bandwidth
+  Console. Deploy it on every host you want to measure between; any agent can
+  send to any other, and the console picks the direction per run.
+vendor: bwtest
+homepage: https://github.com/bwtest/bwtest
+license: MIT
+
+contents:
+  - src: ${AGENT_BIN}
+    dst: /usr/bin/bwagent
+
+  - src: ${REPO_ROOT}/packaging/systemd/bwagent.service
+    dst: /lib/systemd/system/bwagent.service
+
+  # config keeps an operator's edits across upgrades instead of overwriting them.
+  - src: ${REPO_ROOT}/packaging/systemd/bwagent.env
+    dst: /etc/bwagent/bwagent.env
+    type: config|noreplace
+
+  - src: ${REPO_ROOT}/LICENSE
+    dst: /usr/share/doc/bwagent/LICENSE
+
+scripts:
+  postinstall: ${REPO_ROOT}/packaging/nfpm/postinstall.sh
+  preremove: ${REPO_ROOT}/packaging/nfpm/preremove.sh
+  postremove: ${REPO_ROOT}/packaging/nfpm/postremove.sh
+
+overrides:
+  rpm:
+    depends: []
+  deb:
+    depends: []

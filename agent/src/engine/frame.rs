@@ -3,8 +3,8 @@
 //! Large-file mode asks "how fast is this link?". This module asks the question
 //! the user actually cares about: **how much of that do you keep when the payload
 //! is three thousand discrete frame files instead of one stream?** Every frame
-//! pays open + I/O + close on the source, crosses the wire with a header, then
-//! pays open + I/O + close again on the sink. Those costs are measured separately
+//! pays open + I/O + close on the sender, crosses the wire with a header, then
+//! pays open + I/O + close again on the receiver. Those costs are measured separately
 //! so the Gantt can show whether you are losing time to the disk or to the wire.
 //!
 //! What makes this frametest rather than merely "lots of small writes" is the
@@ -31,12 +31,15 @@ use anyhow::{bail, Context, Result};
 
 use crate::protocol::{
     histogram_bucket, FrameMode, FrameOrder, FrameProgress, FrameSpec, FrameStats, FrameStorage,
-    MinAvgMax, Scenario, WindowRow,
+    LaneUpdate, MinAvgMax, Scenario, WindowRow,
 };
+// Re-exported so transport modules can name lanes as `frame::Lane` alongside
+// the rest of the frame vocabulary they already import from here.
+pub use crate::protocol::Lane;
 
 /// Per-frame wire header: `seq: u64, len: u32, flags: u32`, little-endian.
 /// Deliberately minimal — there is no per-frame acknowledgement, because a
-/// round-trip per frame would distort the very thing being measured. The sink
+/// round-trip per frame would distort the very thing being measured. The receiver
 /// reports its own I/O timings through its own telemetry stream instead.
 pub const FRAME_HEADER_LEN: usize = 16;
 
@@ -132,6 +135,10 @@ pub struct FrameCounters {
     pub close: StageStat,
     /// Whole-frame time.
     pub file: StageStat,
+    /// Time handing the frame to / taking it from the transport. Measured
+    /// rather than inferred, so the Gantt's wire band cannot silently absorb
+    /// queue waits and scheduler stalls the way a subtraction would.
+    pub wire: StageStat,
     /// Time spent purely in filesystem calls (create + io + close). Tracked apart
     /// from `file` because in Memory storage mode `file` is still meaningful while
     /// this collapses to ~0 — that gap is what the Gantt's I/O band shows.
@@ -150,6 +157,7 @@ impl Default for FrameCounters {
             io: StageStat::default(),
             close: StageStat::default(),
             file: StageStat::default(),
+            wire: StageStat::default(),
             fs_ns: AtomicU64::new(0),
             hist: Default::default(),
             ticks: Mutex::new(Vec::new()),
@@ -168,6 +176,7 @@ impl FrameCounters {
         self.io.record(t.io_ns);
         self.close.record(t.close_ns);
         self.file.record(t.total_ns);
+        self.wire.record(t.wire_ns);
         self.fs_ns
             .fetch_add(t.create_ns + t.io_ns + t.close_ns, Ordering::Relaxed);
         self.bytes.fetch_add(t.bytes, Ordering::Relaxed);
@@ -314,6 +323,168 @@ pub struct FrameTiming {
     pub close_ns: u64,
     pub total_ns: u64,
     pub bytes: u64,
+    /// Time handing the frame to (or taking it from) the transport.
+    ///
+    /// On the sender this is the `write_all` into the socket, which for TCP
+    /// returns once the bytes are buffered by the kernel, not once they land at
+    /// the far end. It is therefore "time spent transmitting", not flight time;
+    /// the receiver's receive lane is what shows arrival. Measuring it directly
+    /// still beats the old approach of inferring wire cost by subtracting disk
+    /// time from whole-frame time, which quietly absorbed every other stall.
+    pub wire_ns: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle lanes
+// ---------------------------------------------------------------------------
+
+/// Wall-clock extent and busy time of one lifecycle lane, accumulated
+/// lock-free across every worker touching that stage.
+#[derive(Debug)]
+pub struct LaneStat {
+    /// Offset of the lane's first work. `u64::MAX` until something happens, so
+    /// an untouched lane is distinguishable from one that started at zero.
+    first_ns: AtomicU64,
+    last_ns: AtomicU64,
+    busy_ns: AtomicU64,
+    done: AtomicU64,
+    complete: AtomicBool,
+}
+
+impl Default for LaneStat {
+    fn default() -> Self {
+        Self {
+            first_ns: AtomicU64::new(u64::MAX),
+            last_ns: AtomicU64::new(0),
+            busy_ns: AtomicU64::new(0),
+            done: AtomicU64::new(0),
+            complete: AtomicBool::new(false),
+        }
+    }
+}
+
+impl LaneStat {
+    /// Record one unit of work spanning `[from_ns, to_ns)` from the run epoch.
+    pub fn mark(&self, from_ns: u64, to_ns: u64) {
+        self.first_ns.fetch_min(from_ns, Ordering::Relaxed);
+        self.last_ns.fetch_max(to_ns, Ordering::Relaxed);
+        self.busy_ns
+            .fetch_add(to_ns.saturating_sub(from_ns), Ordering::Relaxed);
+        self.done.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Mark the lane as started without crediting any completed work.
+    ///
+    /// Staging a large frame set can spend seconds on its first file, and until
+    /// something touches the lane `snapshot` returns `None` — so the console has
+    /// nothing to draw and falls back to an indeterminate bar that says only
+    /// "working". Opening the lane at zero lets it draw "0 / N" from the outset.
+    pub fn begin(&self, at_ns: u64) {
+        self.first_ns.fetch_min(at_ns, Ordering::Relaxed);
+        self.last_ns.fetch_max(at_ns, Ordering::Relaxed);
+    }
+
+    fn touched(&self) -> bool {
+        self.first_ns.load(Ordering::Relaxed) != u64::MAX
+    }
+}
+
+/// The five lifecycle lanes for one end, sharing a single run epoch.
+///
+/// Both ends keep one of these. The sender fills generate / read / transmit,
+/// the receiver fills receive / write; each streams only the lanes it actually
+/// touched, so the console never has to guess which half it is looking at.
+#[derive(Debug)]
+pub struct Lanes {
+    epoch: Instant,
+    pub generate: LaneStat,
+    pub read: LaneStat,
+    pub transmit: LaneStat,
+    pub receive: LaneStat,
+    pub write: LaneStat,
+    /// Frames expected through the lanes, for a progress fraction.
+    pub total: AtomicU64,
+}
+
+impl Lanes {
+    pub fn new(total: u64) -> Arc<Self> {
+        Arc::new(Self {
+            epoch: Instant::now(),
+            generate: LaneStat::default(),
+            read: LaneStat::default(),
+            transmit: LaneStat::default(),
+            receive: LaneStat::default(),
+            write: LaneStat::default(),
+            total: AtomicU64::new(total),
+        })
+    }
+
+    /// Nanoseconds since the run epoch — the timestamp workers hand to `mark`.
+    pub fn now_ns(&self) -> u64 {
+        self.epoch.elapsed().as_nanos() as u64
+    }
+
+    fn stat(&self, lane: Lane) -> &LaneStat {
+        match lane {
+            Lane::Generate => &self.generate,
+            Lane::Read => &self.read,
+            Lane::Transmit => &self.transmit,
+            Lane::Receive => &self.receive,
+            Lane::Write => &self.write,
+        }
+    }
+
+    /// Mark a lane finished, so the console stops drawing it as still running.
+    pub fn finish(&self, lane: Lane) {
+        self.stat(lane).complete.store(true, Ordering::Relaxed);
+    }
+
+    /// Mark every lane finished — called once the run's workers have joined.
+    pub fn finish_all(&self) {
+        for lane in [
+            Lane::Generate,
+            Lane::Read,
+            Lane::Transmit,
+            Lane::Receive,
+            Lane::Write,
+        ] {
+            self.finish(lane);
+        }
+    }
+
+    /// Snapshot one lane, or `None` if nothing has touched it — an untouched
+    /// lane is omitted rather than sent as an empty bar the user must decode.
+    pub fn snapshot(&self, lane: Lane, run_id: &str, end: &str) -> Option<LaneUpdate> {
+        let s = self.stat(lane);
+        if !s.touched() {
+            return None;
+        }
+        Some(LaneUpdate {
+            run_id: run_id.to_string(),
+            end: end.to_string(),
+            lane,
+            start_ms: ns_ms(s.first_ns.load(Ordering::Relaxed)),
+            end_ms: ns_ms(s.last_ns.load(Ordering::Relaxed)),
+            busy_ms: ns_ms(s.busy_ns.load(Ordering::Relaxed)),
+            done: s.done.load(Ordering::Relaxed),
+            total: self.total.load(Ordering::Relaxed),
+            complete: s.complete.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Snapshot every touched lane.
+    pub fn snapshot_all(&self, run_id: &str, end: &str) -> Vec<LaneUpdate> {
+        [
+            Lane::Generate,
+            Lane::Read,
+            Lane::Transmit,
+            Lane::Receive,
+            Lane::Write,
+        ]
+        .into_iter()
+        .filter_map(|l| self.snapshot(l, run_id, end))
+        .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +501,14 @@ pub struct FramePlan {
     ext: String,
     digits: usize,
     first: u64,
+    /// Set once the frame set has been materialised on disk up front.
+    ///
+    /// The whole point of pre-generation is that the run measures transmission,
+    /// not file creation — so once the frames exist, a `Write` scenario loads
+    /// them the same way a `Read` one does. Creation cost is not discarded, it
+    /// moves to its own Gantt lane where it can be seen rather than smeared
+    /// across every frame's transmit time.
+    pregenerated: AtomicBool,
 }
 
 impl FramePlan {
@@ -366,7 +545,30 @@ impl FramePlan {
             ext,
             digits,
             first,
+            pregenerated: AtomicBool::new(false),
         })
+    }
+
+    /// How `load_frame` should fetch a frame during transmission.
+    ///
+    /// Identical to the scenario's mode until the frames have been staged, at
+    /// which point `Write` becomes `Read`: the files already exist, so the
+    /// transmit loop reads them back instead of re-creating them.
+    pub fn load_mode(&self) -> FrameMode {
+        if self.pregenerated.load(Ordering::Relaxed) {
+            FrameMode::Read
+        } else {
+            self.spec.mode
+        }
+    }
+
+    /// Whether the frame set needs staging before the run can start. `Read`
+    /// scenarios point at frames that already exist, and `Memory` storage never
+    /// touches a filesystem, so neither has anything to generate.
+    pub fn needs_staging(&self) -> bool {
+        matches!(self.spec.storage, FrameStorage::Disk)
+            && matches!(self.spec.mode, FrameMode::Write)
+            && !self.pregenerated.load(Ordering::Relaxed)
     }
 
     pub fn total(&self) -> u64 {
@@ -549,6 +751,11 @@ impl FrameQueue {
         })
     }
 
+    /// Queue depth, or 0 for unbounded.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     /// Offer a frame. Returns false when the queue was full — the caller counts
     /// that as a drop.
     pub fn offer(&self, pos: u64) -> bool {
@@ -631,8 +838,15 @@ pub fn run_pacer(
     };
 
     // Pre-buffer: stage frames before the clock starts, so the run measures
-    // steady-state playback rather than the cold start.
-    let prebuf = (plan.spec.prebuffer as u64).min(total);
+    // steady-state playback rather than the cold start. It can never exceed what
+    // the queue can actually hold — a pre-buffer deeper than `-q` would fill the
+    // queue, leave `pos` short of `prebuf`, and make the deadline below run
+    // backwards from the run start.
+    let cap = queue.capacity();
+    let mut prebuf = (plan.spec.prebuffer as u64).min(total);
+    if cap > 0 {
+        prebuf = prebuf.min(cap as u64);
+    }
     let mut pos = 0u64;
     while pos < prebuf {
         if !queue.offer(pos) {
@@ -648,7 +862,9 @@ pub fn run_pacer(
         }
         if let Some(period) = period {
             // Absolute deadline from the run start, so pacing does not drift.
-            let due = period.mul_f64((pos - prebuf) as f64);
+            // Saturating: `pos < prebuf` would otherwise wrap to a ~24-billion-year
+            // sleep that parks the pacer and hangs the whole run silently.
+            let due = period.mul_f64(pos.saturating_sub(prebuf) as f64);
             let now = start.elapsed();
             if due > now {
                 std::thread::sleep(due - now);
@@ -663,7 +879,89 @@ pub fn run_pacer(
 }
 
 // ---------------------------------------------------------------------------
-// Source side
+// Staging
+// ---------------------------------------------------------------------------
+
+/// Materialise the whole frame set on the sender's disk before any of it is
+/// transmitted, recording the cost in the `Generate` lane.
+///
+/// This exists because the question the tool is asked is "how fast does this
+/// move over the wire?". Creating a frame inside the send loop — which is what
+/// the transmit path used to do — folds file-creation cost into every frame's
+/// measured transfer time, so a slow disk reads as a slow network. Staging the
+/// set up front separates the two: creation becomes its own visible phase, and
+/// what follows measures read-plus-transmit against files that already exist.
+///
+/// Generation is deliberately sequential. It lays the frames down in index
+/// order, the way a real capture would write them, so the read phase that
+/// follows sees a realistic on-disk layout rather than one interleaved by
+/// however many staging threads happened to run. Staging time is reported but
+/// excluded from the run's throughput figures.
+///
+/// Returns the number of frames written. A `stop` mid-stage aborts early and
+/// reports how far it got.
+pub fn pregenerate(
+    plan: &Arc<FramePlan>,
+    lanes: &Arc<Lanes>,
+    stop: &crate::engine::Stop,
+    mut on_progress: impl FnMut(),
+) -> Result<u64> {
+    if !plan.needs_staging() {
+        return Ok(0);
+    }
+    let spec = &plan.spec;
+    let total_bytes = spec.frame_bytes as usize;
+    let ios = spec.ios_per_frame.max(1) as usize;
+    let chunk = align_chunk(total_bytes / ios, spec.direct_io);
+
+    // One buffer for the whole stage: the payload pattern is identical frame to
+    // frame, and what is being measured is the filesystem, not memset.
+    let mut buf = AlignedBuf::new(total_bytes.max(1));
+    for b in buf.as_mut_slice().iter_mut() {
+        *b = 0xAB;
+    }
+
+    let total = plan.total();
+    let mut written = 0u64;
+
+    // Open the lane and report 0/total before writing anything, so the console
+    // shows the file count it is working towards immediately rather than after
+    // the first frame lands.
+    lanes.generate.begin(lanes.now_ns());
+    on_progress();
+
+    for pos in 0..total {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let idx = plan.at(pos);
+        let path = plan.path_for(&spec.path, idx);
+
+        let t0 = lanes.now_ns();
+        let mut f =
+            open_frame(&path, true, spec.direct_io).with_context(|| format!("stage frame {idx}"))?;
+        let mut n = 0usize;
+        while n < total_bytes {
+            let take = chunk.min(total_bytes - n).min(buf.len());
+            f.write_all(&buf.as_slice()[..take])
+                .with_context(|| format!("stage frame {idx}"))?;
+            n += take;
+        }
+        drop(f);
+        lanes.generate.mark(t0, lanes.now_ns());
+
+        written += 1;
+        on_progress();
+    }
+
+    lanes.finish(Lane::Generate);
+    // From here the transmit path reads these files rather than recreating them.
+    plan.pregenerated.store(true, Ordering::Relaxed);
+    Ok(written)
+}
+
+// ---------------------------------------------------------------------------
+// Sender side
 // ---------------------------------------------------------------------------
 
 /// Produce one frame's payload, timing the filesystem work.
@@ -703,7 +1001,9 @@ pub fn load_frame(
     let path = plan.path_for(&spec.path, idx);
     let ios = spec.ios_per_frame.max(1) as usize;
 
-    match spec.mode {
+    // `load_mode`, not `spec.mode`: after staging, a Write scenario reads back
+    // the frames it generated rather than writing them again mid-flight.
+    match plan.load_mode() {
         FrameMode::Write => {
             let t0 = Instant::now();
             let mut f = open_frame(&path, true, spec.direct_io)?;
@@ -806,15 +1106,16 @@ fn align_down(n: u64, direct: bool) -> u64 {
     (n / DIRECT_ALIGN) * DIRECT_ALIGN
 }
 
-/// The source-side worker body for multi-file mode: pull frames from the queue,
+/// The sender-side worker body for multi-file mode: pull frames from the queue,
 /// load each from storage, and push it down the connection with its header.
 ///
 /// `send` is the transport hook, so TCP/TLS, UDP and QUIC all reuse this loop.
-pub fn source_frame_worker<W: Write>(
+pub fn send_frame_worker<W: Write>(
     plan: Arc<FramePlan>,
     queue: Arc<FrameQueue>,
     counters: Arc<FrameCounters>,
     net: Arc<crate::engine::Counters>,
+    lanes: Arc<Lanes>,
     idx: usize,
     mut send: W,
     stop: crate::engine::Stop,
@@ -826,6 +1127,9 @@ pub fn source_frame_worker<W: Write>(
 
         let whole = Instant::now();
         let mut t = FrameTiming::default();
+
+        // Read lane: pulling the (already staged) frame off disk.
+        let read_from = lanes.now_ns();
         let payload = match load_frame(&plan, frame_idx, &mut buf, &mut t) {
             Ok(n) => n,
             Err(e) => {
@@ -834,9 +1138,11 @@ pub fn source_frame_worker<W: Write>(
                 continue;
             }
         };
+        lanes.read.mark(read_from, lanes.now_ns());
 
-        // Header then payload. Both count toward wire bytes; only the payload
-        // counts as frame bytes, so goodput stays honest.
+        // Transmit lane: header then payload. Both count toward wire bytes;
+        // only the payload counts as frame bytes, so goodput stays honest.
+        let wire_from = lanes.now_ns();
         let hdr = encode_header(frame_idx, payload as u32, 0);
         if send.write_all(&hdr).is_err() {
             break;
@@ -844,6 +1150,10 @@ pub fn source_frame_worker<W: Write>(
         if payload > 0 && send.write_all(&buf.as_slice()[..payload]).is_err() {
             break;
         }
+        let wire_to = lanes.now_ns();
+        lanes.transmit.mark(wire_from, wire_to);
+
+        t.wire_ns = wire_to.saturating_sub(wire_from);
         t.total_ns = whole.elapsed().as_nanos() as u64;
         t.bytes = payload as u64;
 
@@ -854,29 +1164,34 @@ pub fn source_frame_worker<W: Write>(
 }
 
 // ---------------------------------------------------------------------------
-// Sink side
+// Receiver side
 // ---------------------------------------------------------------------------
 
-/// The sink-side worker body: read header + payload, then store the frame,
+/// The receiver-side worker body: read header + payload, then store the frame,
 /// timing the filesystem work separately so the console can attribute it.
-pub fn sink_frame_worker<R: Read>(
+pub fn recv_frame_worker<R: Read>(
     spec: Arc<FrameSpec>,
     plan: Arc<FramePlan>,
     counters: Arc<FrameCounters>,
     net: Arc<crate::engine::Counters>,
+    lanes: Arc<Lanes>,
     idx: usize,
     mut recv: R,
     stop: crate::engine::Stop,
 ) {
-    let root = if spec.sink_path.is_empty() {
+    let root = if spec.dest_path.is_empty() {
         spec.path.clone()
     } else {
-        spec.sink_path.clone()
+        spec.dest_path.clone()
     };
     let cap = spec.frame_bytes.max(1) as usize;
     let mut buf = AlignedBuf::new(cap);
 
     while !stop.load(Ordering::Relaxed) {
+        // Waiting on the header is idle time between frames, not receive work,
+        // so the receive lane opens only once a frame has actually started
+        // arriving. Otherwise every receiver would report a receive lane pinned at
+        // 100% busy for the whole run, which says nothing.
         let mut hdr = [0u8; FRAME_HEADER_LEN];
         if recv.read_exact(&mut hdr).is_err() {
             break;
@@ -885,24 +1200,30 @@ pub fn sink_frame_worker<R: Read>(
         let len = (len as usize).min(cap);
 
         let whole = Instant::now();
+        let recv_from = lanes.now_ns();
         if len > 0 && recv.read_exact(&mut buf.as_mut_slice()[..len]).is_err() {
             break;
         }
+        let recv_to = lanes.now_ns();
+        lanes.receive.mark(recv_from, recv_to);
 
         let mut t = FrameTiming::default();
+        t.wire_ns = recv_to.saturating_sub(recv_from);
         if matches!(spec.storage, FrameStorage::Disk) {
             let path = plan.path_for(&root, seq);
+            let write_from = lanes.now_ns();
             match write_frame_file(&path, &buf.as_slice()[..len], &spec, &mut t) {
                 Ok(()) => {}
                 Err(e) => {
-                    tracing::warn!("sink frame {seq}: {e:#}");
+                    tracing::warn!("receiver frame {seq}: {e:#}");
                     counters.record_drop();
                     continue;
                 }
             }
+            lanes.write.mark(write_from, lanes.now_ns());
         }
         // Memory storage: the frame is discarded here on purpose. That is the
-        // point of the mode — it removes the sink's disk from the measurement.
+        // point of the mode — it removes the receiver's disk from the measurement.
 
         t.total_ns = whole.elapsed().as_nanos() as u64;
         t.bytes = len as u64;
@@ -912,7 +1233,7 @@ pub fn sink_frame_worker<R: Read>(
 }
 
 /// Store one received frame, timing create / write / close separately. Shared by
-/// the TCP and QUIC sinks.
+/// the TCP and QUIC receivers.
 pub fn write_frame_file(
     path: &std::path::Path,
     data: &[u8],
@@ -989,7 +1310,7 @@ mod tests {
             order: FrameOrder::Sequential,
             storage: FrameStorage::Memory,
             path: String::new(),
-            sink_path: String::new(),
+            dest_path: String::new(),
             header_kb: 64,
             files_per_dir: 0,
             name_pattern: String::new(),
@@ -1095,6 +1416,55 @@ mod tests {
         run_pacer(plan, q.clone(), c.clone(), stop);
         assert_eq!(q.len(), 3);
         assert_eq!(c.frames_dropped.load(Ordering::Relaxed), 17);
+    }
+
+    /// Regression: a pre-buffer deeper than the queue used to leave `pos` short
+    /// of `prebuf`, so `pos - prebuf` wrapped and the pacer slept ~24 billion
+    /// years — the queue was never closed, every worker blocked on `take()`, and
+    /// the run reported "running" at 0 Mbps forever with no error.
+    #[test]
+    fn prebuffer_deeper_than_queue_still_completes() {
+        let mut s = spec(4096);
+        s.frame_count = 40;
+        s.fps_limit = 24.0;
+        s.queue_depth = 2;
+        s.prebuffer = 5;
+        let plan = Arc::new(FramePlan::new(s).unwrap());
+        let q = FrameQueue::new(2);
+        let c = FrameCounters::new();
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Drain concurrently so the pacer can make progress against its deadline.
+        let qd = q.clone();
+        let drain = std::thread::spawn(move || {
+            let mut n = 0u64;
+            while qd.take().is_some() {
+                n += 1;
+            }
+            n
+        });
+
+        let done = Arc::new(AtomicBool::new(false));
+        let d2 = done.clone();
+        let c2 = c.clone();
+        let pacer = std::thread::spawn(move || {
+            run_pacer(plan, q, c2, stop);
+            d2.store(true, Ordering::Relaxed);
+        });
+
+        // 40 frames at 24 fps is ~1.7s; anything past that is the hang.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !done.load(Ordering::Relaxed) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(done.load(Ordering::Relaxed), "pacer never finished — prebuffer/queue hang");
+        pacer.join().unwrap();
+        let moved = drain.join().unwrap();
+        // A depth-2 queue may legitimately drop when the consumer is momentarily
+        // behind; what must hold is that every frame is retired one way or the
+        // other, since that sum is exactly what ends the run.
+        let dropped = c.frames_dropped.load(Ordering::Relaxed);
+        assert_eq!(moved + dropped, 40, "every frame must be queued or dropped, never lost");
     }
 
     #[test]
@@ -1236,6 +1606,87 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The behaviour the whole staging change exists for: after pre-generation
+    /// every frame is already on disk, and the transmit path *reads* them rather
+    /// than creating them. If `load_mode` ever stopped flipping, file-creation
+    /// cost would silently reappear inside the measured transmit time.
+    #[test]
+    fn staging_materialises_frames_and_turns_writes_into_reads() {
+        let dir = std::env::temp_dir().join(format!("bwft-stage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut s = spec(64 * 1024 + 4096);
+        s.storage = FrameStorage::Disk;
+        s.path = dir.to_string_lossy().into();
+        s.direct_io = false; // tmpdir may not support direct I/O
+        s.frame_count = 4;
+
+        let plan = Arc::new(FramePlan::new(s.clone()).unwrap());
+        let lanes = Lanes::new(plan.total());
+        let stop: crate::engine::Stop = Arc::new(AtomicBool::new(false));
+
+        assert!(plan.needs_staging(), "a Write/Disk run must stage up front");
+        assert_eq!(plan.load_mode(), FrameMode::Write);
+
+        // Snapshot at each callback: the console must be able to draw "x of 4"
+        // from the very first one, before any file exists.
+        let mut seen: Vec<(u64, u64)> = Vec::new();
+        let n = pregenerate(&plan, &lanes, &stop, || {
+            let g = lanes
+                .snapshot(Lane::Generate, "run", "send")
+                .expect("lane must be reportable from the first callback");
+            seen.push((g.done, g.total));
+        })
+        .unwrap();
+
+        assert_eq!(n, 4);
+        assert_eq!(
+            seen,
+            vec![(0, 4), (1, 4), (2, 4), (3, 4), (4, 4)],
+            "staging must open at 0/total and report progress as it goes"
+        );
+        for i in 0..4u64 {
+            let p = plan.path_for(&s.path, i);
+            assert!(p.exists(), "frame {i} was not staged");
+            assert_eq!(std::fs::metadata(&p).unwrap().len(), s.frame_bytes);
+        }
+
+        // Staged: the transmit loop now reads, and won't re-stage.
+        assert_eq!(plan.load_mode(), FrameMode::Read);
+        assert!(!plan.needs_staging());
+
+        // Generation is a real, closed lane with measured time in it.
+        let g = lanes
+            .snapshot(Lane::Generate, "run", "send")
+            .expect("generate lane must be reported");
+        assert_eq!(g.done, 4);
+        assert!(g.complete);
+        assert!(g.busy_ms > 0.0);
+
+        // And nothing has touched the transmit lane yet.
+        assert!(lanes.snapshot(Lane::Transmit, "run", "send").is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Read-mode and Memory runs have nothing to stage — their frames either
+    /// already exist or never touch a filesystem.
+    #[test]
+    fn staging_is_skipped_when_there_is_nothing_to_generate() {
+        let mut mem = spec(4096);
+        mem.storage = FrameStorage::Memory;
+        assert!(!FramePlan::new(mem).unwrap().needs_staging());
+
+        let dir = std::env::temp_dir().join(format!("bwft-nostage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut rd = spec(4096);
+        rd.mode = FrameMode::Read;
+        rd.storage = FrameStorage::Disk;
+        rd.path = dir.to_string_lossy().into();
+        assert!(!FramePlan::new(rd).unwrap().needs_staging());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// `-e` moves no payload but must still pay (and report) open/close.
     #[test]
     fn empty_mode_transfers_no_payload() {
@@ -1268,6 +1719,7 @@ mod tests {
                 close_ns: 500_000,
                 total_ns: ((ms + 1.5) * 1.0e6) as u64,
                 bytes: 1024 * 1024,
+                wire_ns: 0,
             });
         }
         c.record_drop();

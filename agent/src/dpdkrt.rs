@@ -128,7 +128,7 @@ pub fn configured() -> Option<&'static DpdkConfig> {
 }
 
 /// This agent's IP on the DPDK link, if configured — used when advertising a
-/// sink address for DPDK runs (the control-plane IP is a different network).
+/// receiver address for DPDK runs (the control-plane IP is a different network).
 pub fn local_ip() -> Option<Ipv4Addr> {
     CONFIG.get().map(|c| c.ip)
 }

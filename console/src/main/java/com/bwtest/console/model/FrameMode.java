@@ -3,7 +3,7 @@ package com.bwtest.console.model;
 /** frametest's test mode: {@code -w} write, {@code -r} read, {@code -e} empty. */
 public enum FrameMode {
     WRITE("Write", "Write frames"),
-    /** frametest's default: read pre-existing frames from the source path. */
+    /** frametest's default: read pre-existing frames from the sender path. */
     READ("Read", "Read frames"),
     /** Zero-length frames — isolates open/close cost, i.e. a metadata/IOPS test. */
     EMPTY("Empty", "Empty (open/close only)");

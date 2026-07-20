@@ -1,0 +1,254 @@
+name: CI
+
+# The build chain this drives is the same one a developer runs by hand:
+#
+#   ./configure  ->  make  ->  Maven (console) + Cargo (agent)
+#
+# CI deliberately calls configure and make rather than mvn/cargo directly. If it
+# shortcut straight to the two language tools, the Makefile and configure could
+# rot without anything noticing — and they are what an operator building from a
+# release tarball actually uses.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A force-push mid-run should cancel the superseded run, not race it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build & test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # JDK 21+ is configure's floor: it needs jpackage and jdeps, not just javac.
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            agent/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('agent/Cargo.lock', 'agent/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: configure
+        run: ./configure
+
+      # Surfaced on its own so a failure here is obviously a configure problem
+      # rather than a compile one.
+      - name: show configuration
+        run: make help
+
+      - name: make
+        run: make
+
+      - name: make check
+        run: make check
+
+  # The unit suites do not exercise the agent<->console wire protocol; only a
+  # real run does. This is the job that catches a message or field renamed on
+  # one side and not the other.
+  smoke:
+    name: headless wire smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            agent/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('agent/Cargo.lock', 'agent/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: configure & build agent
+        run: ./configure && make agent
+
+      # mock_console.py drives a genuine run between two agents and exits
+      # non-zero unless it sees telemetry and a well-formed summary.
+      - name: large-file run
+        timeout-minutes: 5
+        run: |
+          cd agent
+          SC_DUR=3 python3 tests/mock_console.py 9077 > smoke.log 2>&1 &
+          console_pid=$!
+          sleep 1
+          ./target/release/bwagent --console 127.0.0.1:9077 --name A &
+          ./target/release/bwagent --console 127.0.0.1:9077 --name B &
+          wait $console_pid
+          status=$?
+          cat smoke.log
+          exit $status
+
+      - name: multi-file (frametest) run
+        timeout-minutes: 10
+        run: |
+          cd agent
+          mkdir -p /tmp/frames-a /tmp/frames-dst
+          # Small on purpose: this asserts the frame path is wired end to end,
+          # not that the runner has fast disks. The default 4K x 1800 preset
+          # would stage ~92 GB.
+          SC_MODE=MultiFile SC_STORAGE=Disk SC_FRAME_MODE=Write \
+          SC_FRAME_BYTES=1048576 SC_FRAME_COUNT=200 SC_THREADS=4 \
+          SC_FRAME_PATH=/tmp/frames-a SC_DEST_PATH=/tmp/frames-dst \
+            python3 tests/mock_console.py 9077 > frames.log 2>&1 &
+          console_pid=$!
+          sleep 1
+          ./target/release/bwagent --console 127.0.0.1:9077 --name A &
+          ./target/release/bwagent --console 127.0.0.1:9077 --name B &
+          wait $console_pid
+          status=$?
+          cat frames.log
+          exit $status
+
+  # Packaging is the part most likely to break and the part a developer is least
+  # likely to run locally: it needs the JavaFX jmods, and its failures (a missing
+  # JDK module, a glibc floor, an undeclared GTK dep) produce packages that build
+  # and install perfectly and fail only once running. Build them, then install
+  # them into clean distro containers and check they actually start.
+  package:
+    name: packages (linux/amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            agent/target
+          key: ${{ runner.os }}-cargo-pkg-${{ hashFiles('agent/Cargo.lock', 'agent/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-pkg-
+
+      # jpackage needs the jmods bundle, not the SDK. Unpack it somewhere the
+      # job owns; configure records this path into config.mk.
+      - name: Fetch JavaFX jmods
+        run: |
+          set -euo pipefail
+          ver=23.0.1
+          url="https://download2.gluonhq.com/openjfx/${ver}/openjfx-${ver}_linux-x64_bin-jmods.zip"
+          curl -fsSL -o /tmp/jmods.zip "$url"
+          mkdir -p "$HOME/javafx"
+          unzip -q /tmp/jmods.zip -d "$HOME/javafx"
+          echo "JMODS=$HOME/javafx/javafx-jmods-${ver}" >> "$GITHUB_ENV"
+
+      # jpackage shells out to the native packagers: dpkg-deb ships on the
+      # runner, rpmbuild does not, and without it `make rpm` fails at the very
+      # last step after doing all the work.
+      - name: Native package tooling
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq rpm fakeroot
+
+      - name: nfpm (agent .deb/.rpm)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/nfpm.deb \
+            https://github.com/goreleaser/nfpm/releases/download/v2.41.1/nfpm_2.41.1_amd64.deb
+          sudo dpkg -i /tmp/nfpm.deb
+          nfpm --version
+
+      - name: configure
+        run: ./configure --with-javafx-jmods="$JMODS"
+
+      - name: build deb and rpm
+        run: make packages
+
+      # Proves the guard added after a native `make deb` was found to report
+      # success while silently producing no agent package.
+      - name: missing-nfpm guard must fail loudly
+        run: |
+          set -euo pipefail
+          sudo rm -f "$(command -v nfpm)"
+          if make agent-pkg PKG_TYPE=deb >/dev/null 2>&1; then
+            echo "::error::agent-pkg succeeded without nfpm — the guard regressed"
+            exit 1
+          fi
+          echo "guard held: agent-pkg fails when nfpm is absent"
+
+      # Bounded: verify-linux.sh has no internal timeout, and an unreachable
+      # container engine leaves it blocked on a socket read forever rather than
+      # failing. A hung job is worse than a failed one — it tells you nothing
+      # and burns a runner until the job limit.
+      - name: verify packages in clean distro containers
+        timeout-minutes: 25
+        run: make verify
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-packages
+          path: packaging/dist/*
+          if-no-files-found: error
+
+  # ADVISORY ONLY — this job reports but never fails the build.
+  #
+  # As of adding this workflow the agent has ~25 clippy findings and does not
+  # match rustfmt, so making either blocking would red-X every PR on day one for
+  # reasons unrelated to the change under review. The job exists to make that
+  # backlog visible and to stop it growing silently. Drop the two
+  # continue-on-error lines once the tree is clean — that is the point of it.
+  lint:
+    name: clippy & fmt (advisory)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: cargo fmt
+        working-directory: agent
+        run: cargo fmt --check
+        continue-on-error: true
+
+      - name: cargo clippy
+        working-directory: agent
+        run: cargo clippy --all-targets -- -D warnings
+        continue-on-error: true

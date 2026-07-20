@@ -1,0 +1,37 @@
+[Unit]
+Description=bwagent bandwidth test surface
+Documentation=https://github.com/bwtest/bwtest
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bwagent
+Group=bwagent
+
+# The agent dials out to the console and is configured entirely by environment;
+# clap's `env` feature maps each variable onto an existing flag. BW_CONSOLE still
+# defaults to 127.0.0.1 and must be set for a remote agent; BW_ADVERTISE is now
+# derived from the control connection, so it only needs setting to override that.
+EnvironmentFile=/etc/bwagent/bwagent.env
+ExecStart=/usr/bin/bwagent
+
+Restart=on-failure
+RestartSec=5s
+
+# The agent saturates links on purpose, so it needs room to work: the default
+# file-descriptor ceiling is well below what thousands of concurrent streams
+# and the multi-file frame path require.
+LimitNOFILE=1048576
+
+# Hardening. Deliberately not sandboxed further than this — the frametest path
+# reads and writes real files on operator-chosen paths (often a SAN mount), so
+# ProtectHome and a restrictive ReadWritePaths would break the workload it
+# exists to measure.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=false
+
+[Install]
+WantedBy=multi-user.target

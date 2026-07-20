@@ -8,6 +8,18 @@
 # `bwnet` network: each advertises its service name, so when the console pairs
 # e.g. edge1 -> edge2, edge1 connects straight to "edge2" over bwnet.
 #
+# Mixing host and container agents needs more than that, in both directions:
+#
+#   container sender -> host receiver   The host receiver advertises 127.0.0.1, which
+#     inside a container names the container. The sender detects that it is
+#     containerised and retries via the host gateway; nothing to configure.
+#
+#   host sender -> container receiver   The host cannot reach a container's
+#     ephemeral port at all, so each agent below pins --data-port and publishes
+#     it, then advertises "<service>,127.0.0.1" — the first for peers on bwnet,
+#     the second for the host reaching the published port. The sender tries both
+#     and keeps whichever answers.
+#
 # Override the console port with BW_CONSOLE_PORT (defaults to 9077).
 
 x-agent: &agent
@@ -16,29 +28,38 @@ x-agent: &agent
     dockerfile: Dockerfile
   image: bwagent:latest
   networks: [bwnet]
-  # Lets containers resolve the host on both Docker Desktop and Linux.
+  # Lets containers resolve the host under Docker, Podman and nerdctl alike.
+  # Podman provides host.containers.internal on its own; naming both here costs
+  # nothing and means the agent finds a host alias whichever runtime is driving.
   extra_hosts:
     - "host.docker.internal:host-gateway"
+    - "host.containers.internal:host-gateway"
   restart: unless-stopped
 
 services:
   edge1:
     <<: *agent
     container_name: bw-edge1
+    ports: ["57001-57008:57001-57008", "57001-57008:57001-57008/udp"]
     command: ["--console", "host.docker.internal:${BW_CONSOLE_PORT:-9077}",
-              "--name", "edge1", "--advertise", "edge1"]
+              "--name", "edge1", "--advertise", "edge1,127.0.0.1",
+              "--data-port", "57001-57008"]
 
   edge2:
     <<: *agent
     container_name: bw-edge2
+    ports: ["57011-57018:57011-57018", "57011-57018:57011-57018/udp"]
     command: ["--console", "host.docker.internal:${BW_CONSOLE_PORT:-9077}",
-              "--name", "edge2", "--advertise", "edge2"]
+              "--name", "edge2", "--advertise", "edge2,127.0.0.1",
+              "--data-port", "57011-57018"]
 
   edge3:
     <<: *agent
     container_name: bw-edge3
+    ports: ["57021-57028:57021-57028", "57021-57028:57021-57028/udp"]
     command: ["--console", "host.docker.internal:${BW_CONSOLE_PORT:-9077}",
-              "--name", "edge3", "--advertise", "edge3"]
+              "--name", "edge3", "--advertise", "edge3,127.0.0.1",
+              "--data-port", "57021-57028"]
 
   # --- Real DPDK agents (opt-in: `docker compose --profile dpdk up`) ---
   #
@@ -48,16 +69,21 @@ services:
   # the memif server, the other the client; they share the socket via a volume.
   # Brought up by `./run-demo.sh --dpdk`, or directly:
   #   docker compose --profile dpdk up --build
-  dpdk-sink:
+  dpdk-b:
     build:
       context: ./agent
       dockerfile: Dockerfile.dpdk
     image: bwagent-dpdk:latest
-    container_name: bw-dpdk-sink
+    container_name: bw-dpdk-b
     networks: [bwnet]
+    # Kernel-datapath runs (TCP/UDP/QUIC) still go over bwnet, so this side needs
+    # the same published data port as the edges. DPDK protocols ignore it — they
+    # advertise the userspace stack's own 10.99.0.x address instead.
+    ports: ["57031-57038:57031-57038", "57031-57038:57031-57038/udp"]
     privileged: true          # EAL needs mmap/shm privileges
     volumes: ["memifsock:/run/memif"]
-    extra_hosts: ["host.docker.internal:host-gateway"]
+    extra_hosts: ["host.docker.internal:host-gateway",
+                  "host.containers.internal:host-gateway"]
     # The socket lives in a named volume that outlives the container, and memif
     # cannot rebind over a stale inode ("Address already in use" -> DPDK start
     # fails). Clear it before the server binds, or every run after the first
@@ -65,25 +91,29 @@ services:
     entrypoint: ["/bin/sh", "-c",
                  "rm -f /run/memif/memif.sock; exec /usr/local/bin/bwagent \"$@\"", "sh"]
     command: ["--console", "host.docker.internal:${BW_CONSOLE_PORT:-9077}",
-              "--name", "dpdk-sink", "--advertise", "dpdk-sink",
+              "--name", "dpdk-b", "--advertise", "dpdk-b,127.0.0.1",
+              "--data-port", "57031-57038",
               "--dpdk-ip", "10.99.0.2",
-              "--dpdk-eal", "bwagent -l 1 --no-huge -m 256 --no-pci --file-prefix=sink --vdev=net_memif0,role=server,id=0,bsize=16384,socket=/run/memif/memif.sock,socket-abstract=no"]
+              "--dpdk-eal", "bwagent -l 1 --no-huge -m 256 --no-pci --file-prefix=b --vdev=net_memif0,role=server,id=0,bsize=16384,socket=/run/memif/memif.sock,socket-abstract=no"]
 
-  dpdk-src:
+  dpdk-a:
     build:
       context: ./agent
       dockerfile: Dockerfile.dpdk
     image: bwagent-dpdk:latest
-    container_name: bw-dpdk-src
+    container_name: bw-dpdk-a
     networks: [bwnet]
+    ports: ["57041-57048:57041-57048", "57041-57048:57041-57048/udp"]
     privileged: true
     volumes: ["memifsock:/run/memif"]
-    depends_on: [dpdk-sink]
-    extra_hosts: ["host.docker.internal:host-gateway"]
+    depends_on: [dpdk-b]
+    extra_hosts: ["host.docker.internal:host-gateway",
+                  "host.containers.internal:host-gateway"]
     command: ["--console", "host.docker.internal:${BW_CONSOLE_PORT:-9077}",
-              "--name", "dpdk-src", "--advertise", "dpdk-src",
+              "--name", "dpdk-a", "--advertise", "dpdk-a,127.0.0.1",
+              "--data-port", "57041-57048",
               "--dpdk-ip", "10.99.0.1",
-              "--dpdk-eal", "bwagent -l 0 --no-huge -m 256 --no-pci --file-prefix=src --vdev=net_memif0,role=client,id=0,bsize=16384,socket=/run/memif/memif.sock,socket-abstract=no"]
+              "--dpdk-eal", "bwagent -l 0 --no-huge -m 256 --no-pci --file-prefix=a --vdev=net_memif0,role=client,id=0,bsize=16384,socket=/run/memif/memif.sock,socket-abstract=no"]
 
   # Optional persistence for runs + Past Runs replay. Point the console at it:
   #   export BW_INFLUX_URL=http://localhost:8086

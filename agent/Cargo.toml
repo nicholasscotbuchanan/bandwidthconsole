@@ -1,8 +1,8 @@
 [package]
 name = "bwagent"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
-description = "Bandwidth test surface: a single binary that acts as both source and sink, orchestrated by the JavaFX control plane."
+description = "Bandwidth test surface: one binary, deployed everywhere; any agent can send to any other, with the JavaFX control plane picking the direction per run."
 license = "MIT"
 
 [[bin]]

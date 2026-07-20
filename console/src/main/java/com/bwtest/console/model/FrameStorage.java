@@ -4,10 +4,10 @@ package com.bwtest.console.model;
  * Whether frames actually touch a filesystem.
  *
  * <p>This is the A/B that separates two costs the aggregate number hides. In
- * {@link #DISK} the source reads or creates real frame files and the sink writes
+ * {@link #DISK} the sender reads or creates real frame files and the receiver writes
  * them, so the run measures storage <em>and</em> network together — faithful to
  * frametest. In {@link #MEMORY} frames are synthesised in RAM and discarded at
- * the sink, leaving only the network cost of many small transfers.
+ * the receiver, leaving only the network cost of many small transfers.
  *
  * <p>Run both and compare the Gantt's I/O band: if it collapses in Memory mode
  * but throughput barely moves, your disks were never the problem.

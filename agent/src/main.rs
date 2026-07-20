@@ -1,8 +1,8 @@
 //! bwagent — the bandwidth-test surface.
 //!
 //! One binary, two hats. In its default mode it dials the JavaFX console and
-//! serves test runs (as source or sink, assigned per run). The hidden `worker`
-//! subcommand is one process-share of a multi-process source; the lead spawns it
+//! serves test runs (as sender or receiver, assigned per run). The hidden `worker`
+//! subcommand is one process-share of a multi-process sender; the lead spawns it
 //! and merges its NDJSON telemetry (see `procgroup`).
 
 mod capabilities;
@@ -10,6 +10,7 @@ mod dpdkrt;
 mod control;
 mod engine;
 mod frametest_cli;
+mod netenv;
 mod procgroup;
 mod protocol;
 mod sysstat;
@@ -25,7 +26,7 @@ use clap::{Parser, Subcommand};
 use protocol::{AgentMsg, Scenario};
 
 #[derive(Parser)]
-#[command(name = "bwagent", version, about = "Bandwidth test surface (source+sink in one binary)")]
+#[command(name = "bwagent", version, about = "Bandwidth test surface (one binary; any agent can send to any other)")]
 struct Cli {
     /// Console (control plane) address to dial, host:port.
     #[arg(long, env = "BW_CONSOLE", default_value = "127.0.0.1:9077")]
@@ -35,9 +36,31 @@ struct Cli {
     #[arg(long, env = "BW_NAME")]
     name: Option<String>,
 
-    /// Address other agents use to reach this one's data plane (this host's IP).
-    #[arg(long, env = "BW_ADVERTISE", default_value = "127.0.0.1")]
-    advertise: String,
+    /// Host(s) other agents use to reach this one's data plane, comma-separated
+    /// and best first. Defaults to the local address of the control connection
+    /// — i.e. the IP the console already reached us on, which beats guessing at
+    /// loopback.
+    ///
+    /// A list, because an agent can be reachable by more than one name at once:
+    /// a container published to the host is `--advertise "edge1,127.0.0.1"`,
+    /// meaning "my network peers dial edge1, the host dials its own loopback".
+    #[arg(long, env = "BW_ADVERTISE")]
+    advertise: Option<String>,
+
+    /// Fixed port or range (`57001` or `57001-57008`) for the data plane,
+    /// instead of an ephemeral port.
+    ///
+    /// Required to reach a receiver through a container port mapping: a published
+    /// port is fixed when the container starts, so it can never forward a port
+    /// picked per run. Pair with `-p <port>:<port>`. Prefer a range — each
+    /// concurrent run as receiver takes one port, and a lone port limits you to one.
+    #[arg(long, env = "BW_DATA_PORT", default_value = "0")]
+    data_port: String,
+
+    /// Port peers should dial, when the mapping is not 1:1 (e.g. `-p 6000:5000`
+    /// means `--data-port 5000 --advertise-port 6000`). Defaults to --data-port.
+    #[arg(long, env = "BW_ADVERTISE_PORT")]
+    advertise_port: Option<u16>,
 
     /// DPDK EAL command line, enabling the kernel-bypass protocols. Example:
     /// --dpdk-eal "bwagent -l 0 --no-huge -m 256 --no-pci --vdev=net_memif0,role=client,id=0,socket=/run/memif/memif.sock"
@@ -58,7 +81,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Internal: run one process-share of a source and stream NDJSON telemetry.
+    /// Internal: run one process-share of a sender and stream NDJSON telemetry.
     Worker {
         #[arg(long)]
         run_id: String,
@@ -96,6 +119,10 @@ async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let cli = Cli::parse();
+
+    // Receivers bind from this range for the data plane; 0 keeps the ephemeral default.
+    let (first_port, last_port) = parse_port_range(&cli.data_port)?;
+    engine::set_recv_ports(first_port, last_port);
 
     // Record the DPDK datapath config if supplied. EAL is not started here —
     // only when a run actually selects a DPDK protocol.
@@ -141,7 +168,8 @@ async fn main() -> Result<()> {
         console_addr: cli.console.clone(),
         name,
         agent_id: uuid::Uuid::new_v4().to_string(),
-        advertise_ip: cli.advertise.clone(),
+        advertise_ip: cli.advertise.clone().filter(|s| !s.trim().is_empty()),
+        advertise_port: cli.advertise_port,
         caps,
     };
 
@@ -154,6 +182,25 @@ async fn main() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
+}
+
+/// Parse `--data-port`: `0` (ephemeral), `57001`, or `57001-57008`.
+fn parse_port_range(s: &str) -> Result<(u16, u16)> {
+    let s = s.trim();
+    let (first, last) = match s.split_once('-') {
+        Some((a, b)) => (a.trim(), b.trim()),
+        None => (s, s),
+    };
+    let first: u16 = first
+        .parse()
+        .map_err(|_| anyhow::anyhow!("--data-port: {first:?} is not a port number"))?;
+    let last: u16 = last
+        .parse()
+        .map_err(|_| anyhow::anyhow!("--data-port: {last:?} is not a port number"))?;
+    if last < first {
+        anyhow::bail!("--data-port: range {first}-{last} ends before it starts");
+    }
+    Ok((first, last))
 }
 
 /// One process-share: run the engine and print every message as an NDJSON line
@@ -175,7 +222,7 @@ async fn run_worker(run_id: String, target: String, scenario: String) -> Result<
     });
 
     let stop = Arc::new(AtomicBool::new(false));
-    let summary = engine::run_source(run_id.clone(), sc, target, tx.clone(), stop).await;
+    let summary = engine::run_send(run_id.clone(), sc, target, tx.clone(), stop).await;
     match summary {
         Ok(s) => {
             let _ = tx.send(AgentMsg::RunComplete { summary: s });

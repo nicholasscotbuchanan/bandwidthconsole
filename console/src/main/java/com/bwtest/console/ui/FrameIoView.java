@@ -178,8 +178,8 @@ public class FrameIoView extends Region {
         y += 30;
         g.setFill(MUTED);
         g.setFont(Font.font(12));
-        wrap(g, "The Latency Gantt tab splits each frame into source disk → network → "
-                + "sink disk, which is where you see whether the storage or the wire is "
+        wrap(g, "The Latency Gantt tab splits each frame into sender disk → network → "
+                + "receiver disk, which is where you see whether the storage or the wire is "
                 + "costing you the throughput.", x, y, w - 32, 17);
     }
 

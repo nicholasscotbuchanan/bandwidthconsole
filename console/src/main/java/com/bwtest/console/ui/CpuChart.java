@@ -13,8 +13,8 @@ import javafx.scene.paint.Color;
 
 /**
  * Agent-process CPU% per edge node, overlaid per run. Both ends of a run
- * report their own CPU: the source (solid line) pays for generating and
- * encrypting load, the sink (dashed line) for absorbing it. This is where a
+ * report their own CPU: the sender (solid line) pays for generating and
+ * encrypting load, the receiver (dashed line) for absorbing it. This is where a
  * protocol choice shows its cost — TLS and userspace QUIC burn measurably
  * more CPU per bit than plain kernel TCP, on both nodes — and a node pinned
  * at its core count while the other idles is the balance tell.
@@ -35,7 +35,7 @@ public class CpuChart extends StackPane {
         y.setForceZeroInRange(true);
 
         chart = new LineChart<>(x, y);
-        chart.setTitle("CPU per edge node — 100% = one core · solid = source, dashed = sink");
+        chart.setTitle("CPU per edge node — 100% = one core · solid = sender, dashed = receiver");
         chart.setCreateSymbols(false);
         chart.setAnimated(false);
         javafx.scene.layout.VBox box = new javafx.scene.layout.VBox(4, chart, timeline);
@@ -52,9 +52,9 @@ public class CpuChart extends StackPane {
     }
 
     private void track(RunRecord run) {
-        // One line per edge node: the source's agent process and the sink's.
-        nodeSeries(run, run.samples, run.sourceName + " (src)", false);
-        nodeSeries(run, run.sinkSamples, run.sinkName + " (sink)", true);
+        // One line per edge node: the sender's agent process and the receiver's.
+        nodeSeries(run, run.samples, run.fromName + " (sender)", false);
+        nodeSeries(run, run.recvSamples, run.toName + " (receiver)", true);
     }
 
     private void nodeSeries(RunRecord run, ObservableList<Telemetry.Sample> samples,

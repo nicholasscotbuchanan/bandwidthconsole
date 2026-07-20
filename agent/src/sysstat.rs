@@ -1,4 +1,4 @@
-//! Process CPU sampling for the source agent, feeding the console's CPU% chart.
+//! Process CPU sampling for the sender agent, feeding the console's CPU% chart.
 //!
 //! Sampled on its own thread and published to an atomic, so the telemetry loop
 //! just reads the latest value.
@@ -34,7 +34,7 @@ pub fn start() {
 }
 
 /// Most recent process CPU utilisation (100 == one core fully busy; a
-/// multi-threaded source can exceed 100).
+/// multi-threaded sender can exceed 100).
 pub fn current() -> f64 {
     CPU_PCT_X100.load(Ordering::Relaxed) as f64 / 100.0
 }

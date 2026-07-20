@@ -41,7 +41,7 @@ public class ConsoleUI {
         leftScroll.setMinWidth(392);
 
         Surface3D field = new Surface3D(orch.runs, selected);
-        // The live 3D pair: per-thread contribution on the left, source-vs-sink
+        // The live 3D pair: per-thread contribution on the left, sender-vs-receiver
         // goodput/throughput balance on the right.
         ThreadContribution3D threads3d = new ThreadContribution3D(orch.runs, selected);
         Balance3D balance3d = new Balance3D(orch.runs, selected);
@@ -75,6 +75,9 @@ public class ConsoleUI {
         root.setTop(titleBar(orch, port));
         root.setLeft(leftScroll);
         root.setCenter(center);
+        // Pinned to the bottom rather than living in a tab: a run's long silent
+        // phases (staging especially) must be visible whichever view is open.
+        root.setBottom(new RunStatusBar(orch.runs));
     }
 
     public BorderPane root() { return root; }

@@ -2,6 +2,7 @@ package com.bwtest.console;
 
 import com.bwtest.console.model.AgentModel;
 import com.bwtest.console.model.Capabilities;
+import com.bwtest.console.model.Protocol;
 import com.bwtest.console.model.RunRecord;
 import com.bwtest.console.model.Scenario;
 import com.bwtest.console.model.Telemetry;
@@ -24,7 +25,7 @@ import java.util.function.Consumer;
 /**
  * The report nexus. It owns the live agent registry and run history, routes
  * control-channel events onto the JavaFX thread, and sequences the
- * prepare-sink → role-ready → start-source handshake for each run.
+ * prepare-receiver → end-ready → start-sender handshake for each run.
  */
 public class Orchestrator implements ControlListener {
 
@@ -57,29 +58,29 @@ public class Orchestrator implements ControlListener {
         }
     }
 
-    private record RunContext(RunRecord record, AgentConnection source,
-                              AgentConnection sink, Scenario scenario) {}
+    private record RunContext(RunRecord record, AgentConnection sender,
+                              AgentConnection receiver, Scenario scenario) {}
 
     // --- API used by the UI ---
 
     /** Kick off one run between two agents. Returns the record immediately. */
-    public RunRecord startRun(AgentModel source, AgentModel sink, Scenario sc) {
+    public RunRecord startRun(AgentModel sender, AgentModel receiver, Scenario sc) {
         String runId = java.util.UUID.randomUUID().toString();
         int idx = runCounter.incrementAndGet();
         Color color = PALETTE[(idx - 1) % PALETTE.length];
-        RunRecord rec = new RunRecord(runId, idx, sc, source.getName(), sink.getName(), color);
-        AgentConnection srcConn = connById.get(source.id);
-        AgentConnection sinkConn = connById.get(sink.id);
-        if (srcConn == null || sinkConn == null) {
+        RunRecord rec = new RunRecord(runId, idx, sc, sender.getName(), receiver.getName(), color);
+        AgentConnection fromConn = connById.get(sender.id);
+        AgentConnection toConn = connById.get(receiver.id);
+        if (fromConn == null || toConn == null) {
             rec.setState(RunRecord.State.ERROR);
             rec.setMessage("agent disconnected");
             Platform.runLater(() -> runs.add(rec));
             return rec;
         }
-        byRun.put(runId, new RunContext(rec, srcConn, sinkConn, sc));
+        byRun.put(runId, new RunContext(rec, fromConn, toConn, sc));
         Platform.runLater(() -> runs.add(rec));
-        // Sink first; it replies RoleReady and we then start the source.
-        sinkConn.prepareSink(runId, sc);
+        // Receiver first; it replies ReceiveReady and we then start the sender.
+        toConn.prepareReceive(runId, sc);
         return rec;
     }
 
@@ -87,13 +88,13 @@ public class Orchestrator implements ControlListener {
      * How a multi-agent run is wired.
      *
      * <p>These answer genuinely different questions, which is why both exist.
-     * {@link #INCAST} points every source at one sink — "can this one server feed
+     * {@link #INCAST} points every sender at one receiver — "can this one server feed
      * six edit bays at once?", the case where contention actually bites.
-     * {@link #PAIRS} gives each source its own sink — "does throughput scale when
+     * {@link #PAIRS} gives each sender its own receiver — "does throughput scale when
      * nothing is shared?", which isolates per-path capacity from contention.
      */
     public enum FanoutShape {
-        INCAST("N sources → 1 sink"),
+        INCAST("N senders → 1 receiver"),
         PAIRS("N independent pairs");
 
         public final String label;
@@ -104,29 +105,29 @@ public class Orchestrator implements ControlListener {
     /**
      * Start the same scenario concurrently across several agents.
      *
-     * <p>Each leg is a normal two-agent run with its own id, record and sink
-     * listener — an agent can host several sinks at once because each
-     * {@code prepareSink} binds a fresh port. Keeping legs as ordinary runs means
+     * <p>Each leg is a normal two-agent run with its own id, record and receiver
+     * listener — an agent can host several receivers at once because each
+     * {@code prepareReceive} binds a fresh port. Keeping legs as ordinary runs means
      * every existing view renders them without changes; what ties them together
      * is only the shared {@code groupId}.
      *
-     * @return one record per leg, in source order
+     * @return one record per leg, in sender order
      */
-    public List<RunRecord> startFanout(List<AgentModel> sources, List<AgentModel> sinks,
+    public List<RunRecord> startFanout(List<AgentModel> senders, List<AgentModel> receivers,
                                        Scenario sc, FanoutShape shape) {
         List<RunRecord> legs = new ArrayList<>();
-        if (sources.isEmpty() || sinks.isEmpty()) return legs;
+        if (senders.isEmpty() || receivers.isEmpty()) return legs;
 
         String groupId = java.util.UUID.randomUUID().toString();
-        int n = sources.size();
+        int n = senders.size();
         for (int i = 0; i < n; i++) {
-            AgentModel src = sources.get(i);
-            // Incast funnels everything at the first sink; pairs walk the sink
-            // list alongside the sources, wrapping if fewer sinks were given.
-            AgentModel sink = shape == FanoutShape.INCAST
-                    ? sinks.get(0)
-                    : sinks.get(i % sinks.size());
-            RunRecord rec = startRun(src, sink, sc);
+            AgentModel src = senders.get(i);
+            // Incast funnels everything at the first receiver; pairs walk the receiver
+            // list alongside the senders, wrapping if fewer receivers were given.
+            AgentModel receiver = shape == FanoutShape.INCAST
+                    ? receivers.get(0)
+                    : receivers.get(i % receivers.size());
+            RunRecord rec = startRun(src, receiver, sc);
             rec.groupId = groupId;
             rec.groupLeg = i + 1;
             rec.groupSize = n;
@@ -148,11 +149,11 @@ public class Orchestrator implements ControlListener {
     }
 
     /** Run a list of scenarios back-to-back on the same pair, one at a time. */
-    public void startBatch(AgentModel source, AgentModel sink, Deque<Scenario> queue,
+    public void startBatch(AgentModel sender, AgentModel receiver, Deque<Scenario> queue,
                            Consumer<RunRecord> onEach) {
         if (queue.isEmpty()) return;
         Scenario next = queue.pollFirst();
-        RunRecord rec = startRun(source, sink, next);
+        RunRecord rec = startRun(sender, receiver, next);
         if (onEach != null) onEach.accept(rec);
         rec.stateProperty().addListener((obs, o, st) -> {
             if (st == RunRecord.State.DONE || st == RunRecord.State.ERROR
@@ -160,7 +161,7 @@ public class Orchestrator implements ControlListener {
                 // Small gap so sockets fully release before the next bind.
                 new Thread(() -> {
                     try { Thread.sleep(600); } catch (InterruptedException ignore) {}
-                    Platform.runLater(() -> startBatch(source, sink, queue, onEach));
+                    Platform.runLater(() -> startBatch(sender, receiver, queue, onEach));
                 }, "batch-next").start();
             }
         });
@@ -169,8 +170,8 @@ public class Orchestrator implements ControlListener {
     public void abort(RunRecord rec) {
         RunContext ctx = byRun.get(rec.id);
         if (ctx != null) {
-            ctx.source.abort(rec.id);
-            ctx.sink.abort(rec.id);
+            ctx.sender.abort(rec.id);
+            ctx.receiver.abort(rec.id);
             Platform.runLater(() -> {
                 if (rec.getState() == RunRecord.State.RUNNING
                         || rec.getState() == RunRecord.State.PREPARING) {
@@ -207,7 +208,10 @@ public class Orchestrator implements ControlListener {
         RunContext ctx = byRun.get(runId);
         if (ctx == null) return;
         Platform.runLater(() -> ctx.record.setState(RunRecord.State.RUNNING));
-        ctx.source.startSource(runId, ctx.scenario, listenAddr);
+        Protocol p = Scenario.fromWire(ctx.scenario.protocol);
+        String target = AgentConnection.withFallback(
+                listenAddr, ctx.receiver.peerHost(), p != null && p.requiresDpdk);
+        ctx.sender.startSend(runId, ctx.scenario, target);
     }
 
     @Override
@@ -215,26 +219,58 @@ public class Orchestrator implements ControlListener {
         RunContext ctx = byRun.get(sample.runId());
         if (ctx == null) return;
         Platform.runLater(() -> {
-            // Late sink samples can trail the source's RunComplete; drop them.
+            // Late receiver samples can trail the sender's RunComplete; drop them.
             if (ctx.record.getState() != RunRecord.State.RUNNING
                     && ctx.record.getState() != RunRecord.State.PREPARING) return;
-            (sample.fromSink() ? ctx.record.sinkSamples : ctx.record.samples).add(sample);
+            (sample.fromReceiver() ? ctx.record.recvSamples : ctx.record.samples).add(sample);
         });
         persistSample(ctx, sample);
+    }
+
+    @Override
+    public void onPhase(Telemetry.LaneUpdate update) {
+        RunContext ctx = byRun.get(update.runId());
+        if (ctx == null) return;
+        Platform.runLater(() -> ctx.record.applyLane(update));
     }
 
     @Override
     public void onRunComplete(Telemetry.Summary summary) {
         RunContext ctx = byRun.get(summary.runId());
         if (ctx == null) return;
-        // The source is done; tear the sink down too so its listener threads and
+        // The sender is done; tear the receiver down too so its listener threads and
         // telemetry sampler stop (they otherwise run until the agent exits).
-        ctx.sink.abort(summary.runId());
+        ctx.receiver.abort(summary.runId());
         Platform.runLater(() -> {
-            ctx.record.setSummary(summary);
+            // Fold the sender's final lanes in before publishing the summary, so
+            // the Gantt's last frame matches the summary it is drawn beside.
+            for (Telemetry.LaneUpdate u : summary.lanes()) ctx.record.applyLane(u);
+            ctx.record.setSummary(withRecvIo(summary, ctx.record));
             ctx.record.setState(RunRecord.State.DONE);
         });
         persistRun(ctx, summary);
+    }
+
+    /**
+     * Fill in {@code recvIoMs}, which the sender cannot know.
+     *
+     * <p>Only the receiver measures what writing the received frames cost. The
+     * agent's original plan was for the console to merge two {@code RunComplete}
+     * summaries, but the receiver never sends one — it is torn down above rather
+     * than asked for a result — so that field sat at zero and the Gantt's receiver
+     * band was always empty. The receiver's live {@code Write} lane carries the same
+     * number, so take it from there.
+     */
+    private static Telemetry.Summary withRecvIo(Telemetry.Summary s, RunRecord rec) {
+        Telemetry.LaneUpdate w = rec.lanes.get(Telemetry.Lane.WRITE);
+        if (w == null || w.done() == 0) return s;
+        Telemetry.Phases p = s.phases();
+        return new Telemetry.Summary(s.runId(), s.avgMbps(), s.peakMbps(), s.bytesTotal(),
+                s.p50RttMs(), s.p95RttMs(), s.p99RttMs(), s.retransmits(), s.sackActive(),
+                new Telemetry.Phases(p.connectMs(), p.handshakeMs(), p.firstByteMs(),
+                        p.rampMs(), p.steadyMs(), p.teardownMs(), p.sendIoMs(),
+                        w.perFrameMs(), p.netMs()),
+                s.frame(), s.lanes());
     }
 
     // --- InfluxDB persistence ---
@@ -244,11 +280,11 @@ public class Orchestrator implements ControlListener {
         Scenario sc = ctx.scenario;
         influx.write("bw_sample"
                 + ",runId=" + InfluxClient.esc(s.runId())
-                + ",role=" + InfluxClient.esc(s.role())
+                + ",end=" + InfluxClient.esc(s.end())
                 + ",protocol=" + InfluxClient.esc(sc.protocol)
                 + ",arch=" + InfluxClient.esc(sc.architecture)
-                + ",source=" + InfluxClient.esc(ctx.record.sourceName)
-                + ",sink=" + InfluxClient.esc(ctx.record.sinkName)
+                + ",from=" + InfluxClient.esc(ctx.record.fromName)
+                + ",to=" + InfluxClient.esc(ctx.record.toName)
                 + " tSecs=" + s.tSecs()
                 + ",mbps=" + s.mbps()
                 + ",pps=" + s.pps()
@@ -269,8 +305,8 @@ public class Orchestrator implements ControlListener {
                 + ",threads=" + sc.threads
                 + ",processes=" + sc.processes
                 + ",tls=" + sc.tls
-                + ",source=" + InfluxClient.esc(ctx.record.sourceName)
-                + ",sink=" + InfluxClient.esc(ctx.record.sinkName)
+                + ",from=" + InfluxClient.esc(ctx.record.fromName)
+                + ",to=" + InfluxClient.esc(ctx.record.toName)
                 + " label=\"" + sc.shortLabel().replace("\"", "") + "\""
                 + ",avgMbps=" + s.avgMbps()
                 + ",peakMbps=" + s.peakMbps()
@@ -329,16 +365,16 @@ public class Orchestrator implements ControlListener {
             double t = parseDouble(r.get("tSecs"));
             double mbps = parseDouble(r.get("mbps"));
             peak = Math.max(peak, mbps);
-            rec.samples.add(new Telemetry.Sample(rec.id, "source", t, mbps,
+            rec.samples.add(new Telemetry.Sample(rec.id, "send", t, mbps,
                     parseDouble(r.get("pps")), parseDouble(r.get("rttMs")),
                     (long) parseDouble(r.get("retransmits")),
                     parseDouble(r.get("cpu")), List.of(), null));
         }
         // Replays carry only the throughput series Influx stores, so there is no
-        // frame report or I/O breakdown to reconstruct.
+        // frame report, I/O breakdown or lifecycle timeline to reconstruct.
         rec.setSummary(new Telemetry.Summary(rec.id, pr.avgMbps(),
                 peak > 0 ? peak : pr.peakMbps(), 0, 0, 0, 0, 0, false,
-                new Telemetry.Phases(0, 0, 0, 0, 0, 0, 0, 0, 0), null));
+                new Telemetry.Phases(0, 0, 0, 0, 0, 0, 0, 0, 0), null, List.of()));
         rec.setState(RunRecord.State.DONE);
         rec.setMessage("replayed from InfluxDB");
         Platform.runLater(() -> runs.add(rec));

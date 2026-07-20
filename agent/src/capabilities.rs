@@ -42,7 +42,7 @@ pub fn detect() -> Capabilities {
         dpdk: dpdk_supported(),
         dscp: dscp_supported(),
         sack: sack_active(),
-        // Generous ceiling; the source caps offered threads at this.
+        // Generous ceiling; the sender caps offered threads at this.
         max_threads: (cpu_count * 64).max(64),
         cpu_count,
     }

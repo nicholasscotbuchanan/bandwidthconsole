@@ -24,7 +24,7 @@ import java.util.List;
 
 /**
  * The run cockpit. Designed around one question — "how do I start a test?" — so
- * the answer (Source, Sink, Protocol, RUN) is always on screen and never below a
+ * the answer (From, To, Protocol, RUN) is always on screen and never below a
  * scroll. Everything else is secondary and lives under Advanced.
  *
  * Controls that don't apply to the current protocol are *hidden*, not greyed:
@@ -53,14 +53,14 @@ public class ControlPanel extends VBox {
     };
 
     private final Orchestrator orch;
-    private final ComboBox<AgentModel> sourceBox = new ComboBox<>();
-    private final ComboBox<AgentModel> sinkBox = new ComboBox<>();
+    private final ComboBox<AgentModel> fromBox = new ComboBox<>();
+    private final ComboBox<AgentModel> toBox = new ComboBox<>();
     private final ComboBox<Protocol> protoBox = new ComboBox<>();
     private final ComboBox<Architecture> archBox = new ComboBox<>();
     private final ComboBox<RunLength> lengthBox = new ComboBox<>();
     private final ComboBox<TransferMode> modeBox = new ComboBox<>();
 
-    private final Slider threads = new Slider(1, 64, 8);
+    private final Slider threads = new Slider(1, 128, 8);
     private final Slider processes = new Slider(1, 16, 1);
     private final Slider payloadKb = new Slider(1, 256, 32);
     private final Slider targetMbps = new Slider(0, 10000, 0);
@@ -80,7 +80,7 @@ public class ControlPanel extends VBox {
     private final ComboBox<FrameStorage> frameStorage = new ComboBox<>();
     private final ComboBox<FrameOrder> frameOrder = new ComboBox<>();
     private final TextField framePath = new TextField();
-    private final TextField frameSinkPath = new TextField();
+    private final TextField frameDestPath = new TextField();
     private final Label frameSummary = new Label();
 
     // frametest parity flags that few runs need — folded away under Advanced.
@@ -97,7 +97,7 @@ public class ControlPanel extends VBox {
 
     // --- fan-out ---
     private final CheckBox fanoutEnabled = new CheckBox("Fan out across several agents");
-    private final ListView<AgentModel> fanoutSources = new ListView<>();
+    private final ListView<AgentModel> fanoutSenders = new ListView<>();
     private final ComboBox<Orchestrator.FanoutShape> fanoutShape = new ComboBox<>();
 
     private final Deque<Scenario> queue = new ArrayDeque<>();
@@ -107,11 +107,11 @@ public class ControlPanel extends VBox {
     private final Label status = new Label();
 
     private VBox archRow, procRow, payloadRow, rateRow, dscpRow;
-    private VBox frameGroup, frameCustomRow, frameSinkPathRow, framePathRow, frameAdvanced;
+    private VBox frameGroup, frameCustomRow, frameDestPathRow, framePathRow, frameAdvanced;
     private VBox fanoutGroup;
     // Grid labels are hidden alongside their controls; hiding only the control
     // leaves an orphaned label pointing at empty space.
-    private Label sourceLabel, lengthLabel;
+    private Label fromLabel, lengthLabel;
 
     public ControlPanel(Orchestrator orch, ObservableList<AgentModel> agents) {
         this.orch = orch;
@@ -121,12 +121,12 @@ public class ControlPanel extends VBox {
         Label title = new Label("RUN A TEST");
         title.getStyleClass().add("panel-title");
 
-        sourceBox.setItems(agents);
-        sinkBox.setItems(agents);
-        sourceBox.setMaxWidth(Double.MAX_VALUE);
-        sinkBox.setMaxWidth(Double.MAX_VALUE);
-        sourceBox.setPromptText("no agents connected");
-        sinkBox.setPromptText("no agents connected");
+        fromBox.setItems(agents);
+        toBox.setItems(agents);
+        fromBox.setMaxWidth(Double.MAX_VALUE);
+        toBox.setMaxWidth(Double.MAX_VALUE);
+        fromBox.setPromptText("no agents connected");
+        toBox.setPromptText("no agents connected");
 
         protoBox.getItems().setAll(Protocol.values());
         protoBox.getSelectionModel().select(Protocol.TCP);
@@ -150,9 +150,12 @@ public class ControlPanel extends VBox {
         ColumnConstraints c1 = new ColumnConstraints();
         c1.setHgrow(Priority.ALWAYS);
         grid.getColumnConstraints().addAll(c0, c1);
-        sourceLabel = field("Source");
-        grid.addRow(0, sourceLabel, sourceBox);
-        grid.addRow(1, field("Sink"), sinkBox);
+        // "From"/"To" rather than two role nouns: which way this run pushes
+        // data is a property of the run, not of either agent. Any agent can be
+        // on either side, of several runs at once.
+        fromLabel = field("From");
+        grid.addRow(0, fromLabel, fromBox);
+        grid.addRow(1, field("To"), toBox);
         grid.addRow(2, field("Protocol"), protoBox);
         grid.addRow(3, field("Sending"), modeBox);
         lengthLabel = field("Length");
@@ -202,8 +205,8 @@ public class ControlPanel extends VBox {
                 fanoutGroup, runBtn, queueRow, status, advanced);
 
         Runnable recompute = this::refresh;
-        sourceBox.valueProperty().addListener((o, a, b) -> recompute.run());
-        sinkBox.valueProperty().addListener((o, a, b) -> recompute.run());
+        fromBox.valueProperty().addListener((o, a, b) -> recompute.run());
+        toBox.valueProperty().addListener((o, a, b) -> recompute.run());
         protoBox.valueProperty().addListener((o, a, b) -> recompute.run());
         lengthBox.valueProperty().addListener((o, a, b) -> recompute.run());
         modeBox.valueProperty().addListener((o, a, b) -> recompute.run());
@@ -217,7 +220,7 @@ public class ControlPanel extends VBox {
                 frameLoops, frameHeaderKb)) {
             sp.valueProperty().addListener((o, a, b) -> recompute.run());
         }
-        fanoutSources.getSelectionModel().getSelectedItems().addListener(
+        fanoutSenders.getSelectionModel().getSelectedItems().addListener(
                 (javafx.collections.ListChangeListener<AgentModel>) c -> recompute.run());
         agents.addListener((javafx.collections.ListChangeListener<AgentModel>) c -> {
             autoSelect();
@@ -248,8 +251,8 @@ public class ControlPanel extends VBox {
             sp.setEditable(true);
             sp.setMaxWidth(Double.MAX_VALUE);
         }
-        framePath.setPromptText("/mnt/san/frames  (on the source agent)");
-        frameSinkPath.setPromptText("same as source path");
+        framePath.setPromptText("/mnt/san/frames  (on the sender agent)");
+        frameDestPath.setPromptText("same as sender path");
         frameName.setPromptText("frame%06u.tst");
         frameDirectIo.setSelected(true);
         frameSummary.getStyleClass().add("hint");
@@ -257,7 +260,7 @@ public class ControlPanel extends VBox {
 
         frameCustomRow = spinnerRow("Frame size (KB)", frameCustomKb);
         framePathRow = new VBox(4, sectionLabel("Frame directory"), framePath);
-        frameSinkPathRow = new VBox(4, sectionLabel("Sink directory"), frameSinkPath);
+        frameDestPathRow = new VBox(4, sectionLabel("Destination directory"), frameDestPath);
 
         HBox countFps = new HBox(8,
                 spinnerRow("Frames", frameCount),
@@ -277,7 +280,7 @@ public class ControlPanel extends VBox {
                 comboRow("Access order", frameOrder),
                 comboRow("Frame storage", frameStorage),
                 framePathRow,
-                frameSinkPathRow,
+                frameDestPathRow,
                 frameSummary);
         frameGroup.setPadding(new Insets(4, 0, 2, 0));
 
@@ -296,9 +299,9 @@ public class ControlPanel extends VBox {
     }
 
     private void buildFanoutControls(ObservableList<AgentModel> agents) {
-        fanoutSources.setItems(agents);
-        fanoutSources.getSelectionModel().setSelectionMode(SelectionMode.MULTIPLE);
-        fanoutSources.setPrefHeight(96);
+        fanoutSenders.setItems(agents);
+        fanoutSenders.getSelectionModel().setSelectionMode(SelectionMode.MULTIPLE);
+        fanoutSenders.setPrefHeight(96);
         fanoutShape.getItems().setAll(Orchestrator.FanoutShape.values());
         fanoutShape.getSelectionModel().select(Orchestrator.FanoutShape.INCAST);
         fanoutShape.setMaxWidth(Double.MAX_VALUE);
@@ -307,7 +310,7 @@ public class ControlPanel extends VBox {
         hint.getStyleClass().add("hint");
         hint.setWrapText(true);
 
-        VBox body = new VBox(6, sectionLabel("Source agents"), fanoutSources,
+        VBox body = new VBox(6, sectionLabel("From agents"), fanoutSenders,
                 comboRow("Shape", fanoutShape), hint);
         fanoutGroup = new VBox(6, fanoutEnabled, body);
         // Only the body hides; the checkbox that reveals it must stay visible.
@@ -329,19 +332,19 @@ public class ControlPanel extends VBox {
     }
 
     private void autoSelect() {
-        if (sourceBox.getValue() == null && !sourceBox.getItems().isEmpty()) {
-            sourceBox.getSelectionModel().selectFirst();
+        if (fromBox.getValue() == null && !fromBox.getItems().isEmpty()) {
+            fromBox.getSelectionModel().selectFirst();
         }
-        if (sinkBox.getValue() == null) {
-            for (AgentModel a : sinkBox.getItems()) {
-                if (a != sourceBox.getValue()) { sinkBox.getSelectionModel().select(a); break; }
+        if (toBox.getValue() == null) {
+            for (AgentModel a : toBox.getItems()) {
+                if (a != fromBox.getValue()) { toBox.getSelectionModel().select(a); break; }
             }
         }
     }
 
     /** Show only what applies, and say plainly why Run is unavailable. */
     private void refresh() {
-        AgentModel src = sourceBox.getValue(), sink = sinkBox.getValue();
+        AgentModel src = fromBox.getValue(), receiver = toBox.getValue();
         Protocol p = protoBox.getValue();
         boolean quic = p != null && p.isQuic();
         boolean udpFamily = p == Protocol.UDP || p == Protocol.UDP_DPDK;
@@ -353,7 +356,7 @@ public class ControlPanel extends VBox {
         show(frameCustomRow, frames && framePreset.getValue() == FrameSpec.Preset.CUSTOM);
         // Empty-frame mode moves no payload, so a size control would be a lie.
         show(framePathRow, frames && disk);
-        show(frameSinkPathRow, frames && disk);
+        show(frameDestPathRow, frames && disk);
 
         // Multi-file always runs on OS threads — per-frame file I/O is blocking,
         // so there is nothing for a reactor to multiplex and the Threaded/Selector
@@ -369,23 +372,23 @@ public class ControlPanel extends VBox {
         show(lengthLabel, !frames);
         if (quic) tlsEnabled.setSelected(true);
 
-        // Fanning out replaces the single-source picker with the multi-select
+        // Fanning out replaces the single-sender picker with the multi-select
         // list further down, so the whole grid row goes rather than just the box.
         boolean fanout = fanoutEnabled.isSelected();
-        show(sourceBox, !fanout);
-        show(sourceLabel, !fanout);
+        show(fromBox, !fanout);
+        show(fromLabel, !fanout);
 
-        boolean canDscp = both(src, sink, a -> a.caps.dscp);
+        boolean canDscp = both(src, receiver, a -> a.caps.dscp);
         dscpEnabled.setDisable(!canDscp);
         if (!canDscp) dscpEnabled.setSelected(false);
 
-        if (src != null && sink != null) {
-            threads.setMax(Math.min(512, Math.max(2,
-                    Math.min(src.caps.maxThreads, sink.caps.maxThreads))));
-        }
+        // The stream count is a fixed 1..128 for every protocol and mode. It used
+        // to be re-derived from the agents' reported maxThreads, which silently
+        // pinned the slider to 1..2 whenever an agent registered without that
+        // field. Every engine clamps to what it can actually run anyway.
         if (frames) frameSummary.setText(describeFrameRun());
 
-        String blocker = blocker(src, sink, p);
+        String blocker = blocker(src, receiver, p);
         runBtn.setDisable(blocker != null);
         queueBtn.setDisable(blocker != null);
         status.setText(blocker != null ? blocker : queueSummary());
@@ -414,31 +417,31 @@ public class ControlPanel extends VBox {
     }
 
     /** Human explanation of why a run can't start, or null when it can. */
-    private String blocker(AgentModel src, AgentModel sink, Protocol p) {
+    private String blocker(AgentModel src, AgentModel receiver, Protocol p) {
         boolean frames = modeBox.getValue() == TransferMode.MULTI_FILE;
-        List<AgentModel> sources = selectedSources();
+        List<AgentModel> senders = selectedSenders();
 
-        if (sources.isEmpty() || sink == null) {
-            return fanoutEnabled.isSelected() && sink != null
-                    ? "Select one or more source agents to fan out across."
-                    : "Start two agents pointing at this console, then pick a source and sink.";
+        if (senders.isEmpty() || receiver == null) {
+            return fanoutEnabled.isSelected() && receiver != null
+                    ? "Select one or more agents to fan out from."
+                    : "Start two agents pointing at this console, then pick From and To.";
         }
-        for (AgentModel s : sources) {
-            if (s == sink && fanoutShape.getValue() != Orchestrator.FanoutShape.PAIRS) {
-                return "Source and sink must be different agents.";
+        for (AgentModel s : senders) {
+            if (s == receiver && fanoutShape.getValue() != Orchestrator.FanoutShape.PAIRS) {
+                return "From and To must be different agents.";
             }
             if (!s.onlineProperty().get()) return s.getName() + " is offline.";
         }
-        if (!sink.onlineProperty().get()) return "The selected sink is offline.";
+        if (!receiver.onlineProperty().get()) return "The selected receiver is offline.";
 
-        for (AgentModel s : sources) {
-            if (p != null && p.requiresDpdk && !both(s, sink, a -> a.caps.dpdk)) {
+        for (AgentModel s : senders) {
+            if (p != null && p.requiresDpdk && !both(s, receiver, a -> a.caps.dpdk)) {
                 return p.label + " needs DPDK on both agents — "
-                        + missing(s, sink, a -> a.caps.dpdk) + " can't do it.";
+                        + missing(s, receiver, a -> a.caps.dpdk) + " can't do it.";
             }
-            if (p != null && p.requiresSack && !both(s, sink, a -> a.caps.sack)) {
+            if (p != null && p.requiresSack && !both(s, receiver, a -> a.caps.sack)) {
                 return p.label + " needs SACK on both agents — "
-                        + missing(s, sink, a -> a.caps.sack) + " can't do it.";
+                        + missing(s, receiver, a -> a.caps.sack) + " can't do it.";
             }
         }
 
@@ -454,6 +457,13 @@ public class ControlPanel extends VBox {
             }
             if (frameCount.getValue() == null || frameCount.getValue() < 1) {
                 return "Frame count must be at least 1.";
+            }
+            // A pre-buffer deeper than the queue can never be staged: the queue
+            // fills, the rest of the pre-buffer is refused, and the pacer is left
+            // trying to hit deadlines for frames it never queued. 0 = unbounded.
+            if (frameQueue.getValue() > 0 && framePrebuffer.getValue() > frameQueue.getValue()) {
+                return "Pre-buffer (" + framePrebuffer.getValue() + ") can't exceed queue depth ("
+                        + frameQueue.getValue() + ") — raise the queue, or set it to 0 for unbounded.";
             }
             if (framePreset.getValue() == FrameSpec.Preset.CUSTOM
                     && frameCustomKb.getValue() * 1024L <= frameHeaderKb.getValue() * 1024L) {
@@ -481,12 +491,12 @@ public class ControlPanel extends VBox {
         n.setManaged(visible);
     }
 
-    /** Sources for this run: the multi-select list when fanning out, else the box. */
-    private List<AgentModel> selectedSources() {
+    /** Senders for this run: the multi-select list when fanning out, else the box. */
+    private List<AgentModel> selectedSenders() {
         if (fanoutEnabled.isSelected()) {
-            return new ArrayList<>(fanoutSources.getSelectionModel().getSelectedItems());
+            return new ArrayList<>(fanoutSenders.getSelectionModel().getSelectedItems());
         }
-        AgentModel s = sourceBox.getValue();
+        AgentModel s = fromBox.getValue();
         return s == null ? List.of() : List.of(s);
     }
 
@@ -505,7 +515,7 @@ public class ControlPanel extends VBox {
         f.order = frameOrder.getValue().wire;
         f.storage = frameStorage.getValue().wire;
         f.path = framePath.getText().trim();
-        f.sinkPath = frameSinkPath.getText().trim();
+        f.destPath = frameDestPath.getText().trim();
         f.filesPerDir = frameFilesPerDir.getValue();
         f.namePattern = frameName.getText().trim();
         f.asyncDepth = frameAsync.getValue();
@@ -540,14 +550,14 @@ public class ControlPanel extends VBox {
     }
 
     private void runSingle() {
-        List<AgentModel> sources = selectedSources();
-        AgentModel sink = sinkBox.getValue();
-        if (sources.isEmpty() || sink == null) return;
+        List<AgentModel> senders = selectedSenders();
+        AgentModel receiver = toBox.getValue();
+        if (senders.isEmpty() || receiver == null) return;
         Scenario sc = currentScenario();
-        if (fanoutEnabled.isSelected() && sources.size() > 1) {
-            orch.startFanout(sources, List.of(sink), sc, fanoutShape.getValue());
+        if (fanoutEnabled.isSelected() && senders.size() > 1) {
+            orch.startFanout(senders, List.of(receiver), sc, fanoutShape.getValue());
         } else {
-            orch.startRun(sources.get(0), sink, sc);
+            orch.startRun(senders.get(0), receiver, sc);
         }
     }
 
@@ -558,14 +568,14 @@ public class ControlPanel extends VBox {
     }
 
     private void runQueue() {
-        List<AgentModel> sources = selectedSources();
-        if (sources.isEmpty() || sinkBox.getValue() == null) return;
+        List<AgentModel> senders = selectedSenders();
+        if (senders.isEmpty() || toBox.getValue() == null) return;
         if (queue.isEmpty()) { runSingle(); return; }
         Deque<Scenario> copy = new ArrayDeque<>(queue);
         queue.clear();
         runQueueBtn.setText("Run queue");
         status.setText("Running " + copy.size() + " queued scenario(s)…");
-        orch.startBatch(sources.get(0), sinkBox.getValue(), copy, null);
+        orch.startBatch(senders.get(0), toBox.getValue(), copy, null);
     }
 
     // --- builders ---

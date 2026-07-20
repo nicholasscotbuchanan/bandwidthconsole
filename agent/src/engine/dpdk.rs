@@ -174,7 +174,7 @@ fn now_nanos() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
 }
 
-pub async fn run_source(
+pub async fn run_send(
     run_id: String,
     sc: Scenario,
     target_addr: String,
@@ -209,7 +209,7 @@ pub async fn run_source(
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
                     Err(_) => break,
                 }
-                // Absorb any feedback the sink has sent back.
+                // Absorb any feedback the receiver has sent back.
                 while let Some((_, fb)) = port.try_recv() {
                     if fb.len() >= FB {
                         let d_bytes = u64::from_le_bytes(fb[0..8].try_into().unwrap());
@@ -249,7 +249,7 @@ pub async fn run_source(
     timer.first_byte_ms = first_rtt.load(Ordering::Relaxed) as f64 / 1000.0;
 
     let (peak, avg, mut rtts) = sample_loop(
-        run_id.clone(), "source", counters.clone(), stop.clone(), tx.clone(),
+        run_id.clone(), "send", counters.clone(), stop.clone(), tx.clone(),
         sc.duration_secs, sc.bytes_target, sc.continuous,
     )
     .await;
@@ -260,7 +260,7 @@ pub async fn run_source(
         let _ = h.join();
     }
     timer.teardown_ms = teardown.elapsed().as_secs_f64() * 1000.0;
-    timer.ramp_ms = rtts.first().copied().unwrap_or(1.0).max(1.0);
+    timer.ramp_ms = rtts.first().copied().unwrap_or(1.0).max(10.0);
     timer.steady_ms = (sc.duration_secs as f64 * 1000.0 - timer.ramp_ms).max(0.0);
 
     let retransmits = counters.retransmits.load(Ordering::Relaxed);
@@ -268,14 +268,14 @@ pub async fn run_source(
     Ok(timer.finish(retransmits, false, &run_id, peak, avg, bytes, &mut rtts))
 }
 
-pub async fn run_sink(run_id: String, sc: Scenario, tx: Tx) -> Result<(SocketAddr, Stop)> {
+pub async fn run_recv(run_id: String, sc: Scenario, tx: Tx) -> Result<(SocketAddr, Stop)> {
     dpdkrt::start().context("DPDK start")?;
     let port = dpdkrt::bind(0)?;
     let local = port.local;
     let stop: Stop = Arc::new(AtomicBool::new(false));
-    // Sink-side goodput accounting, same shape as the kernel-UDP sink.
+    // Receiver-side goodput accounting, same shape as the kernel-UDP receiver.
     let counters = Counters::new(sc.threads.max(1) as usize);
-    super::spawn_sink_sampler(run_id, counters.clone(), stop.clone(), tx);
+    super::spawn_recv_sampler(run_id, counters.clone(), stop.clone(), tx);
     let stop2 = stop.clone();
 
     std::thread::spawn(move || {
@@ -292,8 +292,13 @@ pub async fn run_sink(run_id: String, sc: Scenario, tx: Tx) -> Result<(SocketAdd
         let mut last_flush = Instant::now();
         while !stop2.load(Ordering::Relaxed) {
             let mut idle = true;
+            // Bounded burst: at DPDK ingress rates an unbounded drain never
+            // returns, so the 250ms feedback flush below would never run and the
+            // sender's counters (which are fed only by that feedback) stay zero.
+            let mut budget = 512;
             while let Some((from, data)) = port.try_recv() {
                 idle = false;
+                budget -= 1;
                 if data.len() >= HDR {
                     let n_peers = peer_idx.len();
                     let idx = *peer_idx.entry(from)
@@ -305,6 +310,9 @@ pub async fn run_sink(run_id: String, sc: Scenario, tx: Tx) -> Result<(SocketAdd
                     t.last_ts = u64::from_le_bytes(data[0..8].try_into().unwrap());
                     let seq = u64::from_le_bytes(data[8..16].try_into().unwrap());
                     t.high_seq = t.high_seq.max(seq);
+                }
+                if budget == 0 {
+                    break;
                 }
             }
             if last_flush.elapsed() >= Duration::from_millis(250) {

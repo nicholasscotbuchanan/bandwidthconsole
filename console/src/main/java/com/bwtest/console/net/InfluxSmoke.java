@@ -22,13 +22,13 @@ public class InfluxSmoke {
         long now = System.currentTimeMillis() * 1_000_000L;
 
         for (int i = 0; i < 5; i++) {
-            in.write("bw_sample,runId=" + runId + ",protocol=Quic,arch=Selector,source=A,sink=B"
+            in.write("bw_sample,runId=" + runId + ",protocol=Quic,arch=Selector,from=A,to=B"
                     + " tSecs=" + (i * 0.2) + ",mbps=" + (1000 + i * 10) + ",pps=500"
                     + ",rttMs=0.5,cpu=42.5,retransmits=0i "
                     + (now + i * 200_000_000L));
         }
         in.write("bw_run,runId=" + runId + ",protocol=Quic,arch=Selector,threads=4,processes=1"
-                + ",tls=true,source=A,sink=B"
+                + ",tls=true,from=A,to=B"
                 + " label=\"QUIC (TLS 1.3) · 4s/1p\",avgMbps=1020.0,peakMbps=1040.0"
                 + ",bytesTotal=123456i,p50=0.5,p95=0.9,p99=1.2,retransmits=0i"
                 + ",connectMs=1.0,handshakeMs=2.0,firstByteMs=0.5,rampMs=10.0"

@@ -3,3 +3,9 @@ console/target/
 console/dependency-reduced-pom.xml
 *.log
 .DS_Store
+packaging/dist/
+packaging/work/
+packaging/resources/bwconsole.iconset/
+config.mk
+build/
+*.tar.gz

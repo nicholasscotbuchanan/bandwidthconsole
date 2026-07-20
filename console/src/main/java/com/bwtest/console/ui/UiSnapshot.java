@@ -33,16 +33,18 @@ public class UiSnapshot extends Application {
 
     private static final String OUT = "/tmp/";
     private ConsoleUI ui;
+    private Orchestrator orch;
+    private ObjectProperty<RunRecord> selected;
 
     @Override
     public void start(Stage stage) throws Exception {
-        Orchestrator orch = new Orchestrator();
+        orch = new Orchestrator();
         // BW_UI_EMPTY renders the cold-start console — no agents, no runs. That
         // is what a user actually meets first, and every empty state has to earn
         // its place there, so it needs looking at as much as the seeded view.
         if (System.getenv("BW_UI_EMPTY") == null) seed(orch);
 
-        ObjectProperty<RunRecord> selected = new SimpleObjectProperty<>();
+        selected = new SimpleObjectProperty<>();
         ConsoleUI ui = new ConsoleUI(orch, 9077, selected);
         this.ui = ui;
 
@@ -71,6 +73,8 @@ public class UiSnapshot extends Application {
             // layout pass after switching mode, and an unchained pause would race
             // the exit below and silently produce no file.
             shootControls(scene, () -> {
+                shootStaging(scene, tabs);
+                shootGanttDone(scene, tabs);
                 shootZoomed(scene, tabs);
                 shootSplash();
                 PauseTransition done = new PauseTransition(Duration.millis(200));
@@ -107,6 +111,58 @@ public class UiSnapshot extends Application {
             next.run();
         });
         p.play();
+    }
+
+    /**
+     * The window mid-staging, which is the state the status bar exists for: no
+     * telemetry is flowing yet, so every chart is empty and the strip is the
+     * only thing telling the user the run is alive. Applied to the live run and
+     * then rolled back, so the other shots still show the transferring state.
+     */
+    private void shootStaging(Scene scene, TabPane tabs) {
+        // Show it over Live Throughput: during staging that chart has nothing to
+        // draw, which is precisely the situation the strip has to cover.
+        for (int i = 0; i < tabs.getTabs().size(); i++) {
+            if ("Live Throughput".equals(tabs.getTabs().get(i).getText())) {
+                tabs.getSelectionModel().select(i);
+                break;
+            }
+        }
+        RunRecord live = null;
+        for (RunRecord r : orch.runs) {
+            if ("run-frames-live".equals(r.id)) live = r;
+        }
+        if (live == null) return;
+
+        var saved = new java.util.HashMap<>(live.lanes);
+        live.lanes.clear();
+        // Paced like real staging of 4K frames to an NVMe array (~500 MB/s), so
+        // the derived rate and ETA in the strip are numbers worth reading.
+        lane(live, Telemetry.Lane.GENERATE, "send", 0, 44_000, 43_100, 430, 720, false);
+        write(scene, OUT + "ui-status-staging.png");
+
+        live.lanes.clear();
+        live.lanes.putAll(saved);
+    }
+
+    /**
+     * The Gantt again with a *finished* frame run selected. The default shot
+     * catches the live run, whose lanes are still open and whose summary has not
+     * arrived — so without this the completed layout, where the setup and
+     * whole-run sections appear underneath, never gets looked at.
+     */
+    private void shootGanttDone(Scene scene, TabPane tabs) {
+        if (selected == null) return;
+        for (int i = 0; i < tabs.getTabs().size(); i++) {
+            if ("Latency Gantt".equals(tabs.getTabs().get(i).getText())) {
+                tabs.getSelectionModel().select(i);
+                break;
+            }
+        }
+        for (RunRecord r : orch.runs) {
+            if ("run-frames".equals(r.id)) selected.set(r);
+        }
+        write(scene, OUT + "ui-gantt-completed.png");
     }
 
     /** Narrow the Live Throughput timeline to 3–7 s and snapshot it, so the
@@ -190,19 +246,20 @@ public class UiSnapshot extends Application {
                 for (int k = 0; k < streams; k++) {
                     per.add(mbps * (1.0 + 0.5 * Math.sin(k * 1.7 + t / 6.0)) / wsum);
                 }
-                r.samples.add(new Telemetry.Sample(r.id, "source", t * 0.25, mbps, mbps * 90,
+                r.samples.add(new Telemetry.Sample(r.id, "send", t * 0.25, mbps, mbps * 90,
                         0.4 + 0.9 * Math.abs(Math.sin(t / 7.0)), t * 3L,
                         80 + 60 * Math.abs(Math.cos(t / 9.0)), per, null));
-                // Sink sees slightly less than was offered — the balance gap.
+                // Receiver sees slightly less than was offered — the balance gap.
                 double eff = System.getenv("BW_UI_EFF") != null
                         ? Double.parseDouble(System.getenv("BW_UI_EFF"))
                         : 0.995 - 0.06 * Math.abs(Math.sin(t / 4.0));
-                r.sinkSamples.add(new Telemetry.Sample(r.id, "sink", t * 0.25, mbps * eff,
+                r.recvSamples.add(new Telemetry.Sample(r.id, "recv", t * 0.25, mbps * eff,
                         mbps * 90 * eff, 0, 0, 22, List.of(), null));
             }
             r.setSummary(new Telemetry.Summary(r.id, peak * 0.86, peak, (long) (peak * 1e6),
                     0.42, 1.28, 2.10, 37, true,
-                    new Telemetry.Phases(1.2, 2.4, 0.8, 18.0, 9800.0, 0.4, 0, 0, 0), null));
+                    new Telemetry.Phases(1.2, 2.4, 0.8, 18.0, 9800.0, 0.4, 0, 0, 0),
+                    null, List.of()));
             // Leave the last run "live" so the Live 3D views render as in a test.
             r.setState(i == specs.length ? RunRecord.State.RUNNING : RunRecord.State.DONE);
             orch.runs.add(r);
@@ -251,9 +308,9 @@ public class UiSnapshot extends Application {
             peakMbps = Math.max(peakMbps, mbps);
             Telemetry.FrameProgress fp = new Telemetry.FrameProgress(
                     fps, done, dropped, frameMs, openMs, ioMs, closeMs);
-            r.samples.add(new Telemetry.Sample(r.id, "source", t * 0.75, mbps, fps,
+            r.samples.add(new Telemetry.Sample(r.id, "send", t * 0.75, mbps, fps,
                     0.6, 0, 140 + 30 * Math.sin(t / 5.0), List.of(), fp));
-            r.sinkSamples.add(new Telemetry.Sample(r.id, "sink", t * 0.75, mbps * 0.98,
+            r.recvSamples.add(new Telemetry.Sample(r.id, "recv", t * 0.75, mbps * 0.98,
                     fps, 0, 0, 60, List.of(),
                     new Telemetry.FrameProgress(fps, done, 0, frameMs * 0.4,
                             0.2, frameMs * 0.3, frameMs * 0.08)));
@@ -276,9 +333,56 @@ public class UiSnapshot extends Application {
         r.setSummary(new Telemetry.Summary(r.id, peakMbps * 0.94, peakMbps,
                 done * f.payloadBytes(), 0.58, 1.44, 2.31, 12, true,
                 new Telemetry.Phases(1.1, 2.2, 0.7, 0, 30000, 0.5, 28.6, 6.1, 4.2),
-                stats));
+                stats, List.of()));
+        seedLifecycle(r, done, true);
         r.setState(RunRecord.State.DONE);
         orch.runs.add(r);
+
+        // A second frame run left mid-flight, so the progressive state of the
+        // Gantt — open-ended bars, partial counts — gets looked at too. Building
+        // only the finished case is how the old view ended up never rendering
+        // during a run at all.
+        RunRecord live = new RunRecord("run-frames-live", idx + 1, sc, "edge-nyc", "laptop-mac",
+                javafx.scene.paint.Color.web("#5eead4"));
+        live.samples.addAll(r.samples.subList(0, 14));
+        live.recvSamples.addAll(r.recvSamples.subList(0, 14));
+        seedLifecycle(live, 268, false);
+        live.setState(RunRecord.State.RUNNING);
+        orch.runs.add(live);
+    }
+
+    /**
+     * Lifecycle lanes shaped like a real staged run: generation finishes before
+     * anything is transmitted, then read / transmit / receive / write overlap
+     * and run to the end. Transmission dwarfs the rest, which is exactly the
+     * case the Gantt's elision has to handle.
+     */
+    private void seedLifecycle(RunRecord r, long frames, boolean complete) {
+        double genMs = 4200;            // staging the frame set up front
+        double runEnd = complete ? 30000 : 12400;
+        // Each downstream stage starts a beat after the one feeding it.
+        lane(r, Telemetry.Lane.GENERATE, "send", 0, genMs, genMs * 0.97, frames,
+                frames, true);
+        lane(r, Telemetry.Lane.READ, "send", genMs + 30, runEnd,
+                (runEnd - genMs) * 0.34, frames, frames, complete);
+        lane(r, Telemetry.Lane.TRANSMIT, "send", genMs + 55, runEnd,
+                (runEnd - genMs) * 0.71, frames, frames, complete);
+        lane(r, Telemetry.Lane.RECEIVE, "recv", genMs + 90, runEnd + 40,
+                (runEnd - genMs) * 0.66, frames, frames, complete);
+        lane(r, Telemetry.Lane.WRITE, "recv", genMs + 140, runEnd + 120,
+                (runEnd - genMs) * 0.41, frames, frames, complete);
+    }
+
+    /**
+     * Seeded lane offsets are already on one shared timeline, so each update is
+     * dated as having arrived when its lane began — which is what pins both
+     * ends to the same origin instead of to the instant this fixture ran.
+     */
+    private void lane(RunRecord r, Telemetry.Lane l, String end, double startMs, double endMs,
+                      double busy, long done, long total, boolean complete) {
+        long base = 1_700_000_000_000L;
+        r.applyLane(new Telemetry.LaneUpdate(r.id, end, l, startMs, endMs, busy,
+                done, total, complete), base + (long) startMs);
     }
 
     /** Mirrors the agent's histogram bucketing so seeded data lands correctly. */

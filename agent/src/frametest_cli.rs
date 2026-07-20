@@ -298,7 +298,7 @@ fn default_spec() -> FrameSpec {
         order: FrameOrder::Sequential,
         storage: FrameStorage::Disk,
         path: String::new(),
-        sink_path: String::new(),
+        dest_path: String::new(),
         header_kb: 64,
         files_per_dir: 0,
         name_pattern: String::new(),
@@ -408,7 +408,7 @@ pub fn run(argv: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Local worker: same frame work as the network source, minus the wire.
+/// Local worker: same frame work as the network sender, minus the wire.
 fn local_worker(
     plan: Arc<FramePlan>,
     queue: Arc<FrameQueue>,
@@ -479,6 +479,8 @@ fn run_streaming(args: &Args) -> Result<()> {
                 close_ns: 0,
                 total_ns: io_ns,
                 bytes: n as u64,
+                // Local streaming benchmark: no transport involved.
+                wire_ns: 0,
             }),
             Err(e) => return Err(e).context("streaming I/O"),
         }

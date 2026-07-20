@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Supported wire protocols for the data plane. `UdpDpdk` is only selectable
-/// when the sink+source agents both report the `dpdk` capability.
+/// when the receiver+sender agents both report the `dpdk` capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Protocol {
     Tcp,
@@ -38,7 +38,7 @@ impl Protocol {
     }
 }
 
-/// How the source generates load — the core architectural question the tool
+/// How the sender generates load — the core architectural question the tool
 /// exists to answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Architecture {
@@ -72,7 +72,7 @@ impl Default for TransferMode {
 pub enum FrameMode {
     /// `-w size` — create and transmit frames.
     Write,
-    /// `-r` — read pre-existing frames from the source path. frametest's default.
+    /// `-r` — read pre-existing frames from the sender path. frametest's default.
     Read,
     /// `-e` — zero-length frames: isolates open/close cost (a metadata/IOPS test).
     Empty,
@@ -101,7 +101,7 @@ impl Default for FrameOrder {
 
 /// Whether frames actually touch a filesystem. `Disk` is faithful to frametest
 /// and measures storage+network together; `Memory` synthesises frames in RAM and
-/// discards them at the sink, isolating the pure network cost of many small
+/// discards them at the receiver, isolating the pure network cost of many small
 /// transfers. Running the same scenario both ways tells you which one is the
 /// bottleneck.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,9 +204,9 @@ pub struct FrameSpec {
     /// Directory frames are read from / written to. Required for `Disk`.
     #[serde(default)]
     pub path: String,
-    /// Where the sink writes received frames. Empty = same as `path`.
+    /// Where the receiver writes received frames. Empty = same as `path`.
     #[serde(default)]
-    pub sink_path: String,
+    pub dest_path: String,
     /// `--header` — per-file header size in KB.
     #[serde(default = "default_header_kb")]
     pub header_kb: u32,
@@ -284,7 +284,7 @@ pub struct Scenario {
     pub architecture: Architecture,
     /// Concurrent worker threads (or async tasks in Selector mode).
     pub threads: u32,
-    /// Concurrent OS processes; the source forks this many workers and
+    /// Concurrent OS processes; the sender forks this many workers and
     /// aggregates their throughput. 1 = single-process.
     pub processes: u32,
     /// Differentiated Services Code Point (0..=63). `dscp_enabled` gates whether
@@ -339,29 +339,29 @@ pub struct Capabilities {
     pub cpu_count: u32,
 }
 
-/// Default for samples from agents that predate the `role` field: only sources
-/// streamed telemetry back then, so "source" is the honest assumption.
-fn default_role() -> String {
-    "source".to_string()
+/// Default for samples from agents that predate the `end` field: only senders
+/// streamed telemetry back then, so "send" is the honest assumption.
+fn default_end() -> String {
+    "send".to_string()
 }
 
 /// One sampled point of a live run, streamed roughly once per second.
-/// Both ends of a run emit these: the source reports offered throughput, the
-/// sink reports delivered goodput — `role` says which side measured it.
+/// Both ends of a run emit these: the sender reports offered throughput, the
+/// receiver reports delivered goodput — `end` says which side measured it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TelemetrySample {
     pub run_id: String,
-    /// "source" or "sink" — which end of the run measured this sample.
-    #[serde(default = "default_role")]
-    pub role: String,
+    /// "send" or "recv" — which end of the run measured this sample.
+    #[serde(default = "default_end")]
+    pub end: String,
     pub t_secs: f64,
     pub mbps: f64,
     pub pps: f64,
     /// Instantaneous application-observed RTT estimate, milliseconds.
     pub rtt_ms: f64,
     pub retransmits: u64,
-    /// Source process CPU utilisation over this interval, percent (0..100*cores).
+    /// Sender process CPU utilisation over this interval, percent (0..100*cores).
     #[serde(default)]
     pub cpu_percent: f64,
     /// Per-stream goodput for this interval, Mbit/s, one entry per active stream.
@@ -394,8 +394,60 @@ pub struct FrameProgress {
     pub close_ms_avg: f64,
 }
 
+/// One stage of a frame's lifecycle, as a Gantt lane.
+///
+/// A frame is generated on the sender's disk, read back, put on the wire,
+/// received at the receiver, and written out there. Those five stages overlap
+/// heavily — while frame 5 is in flight, 6 is being read and 4 is being written
+/// — so each is reported as its own lane with a real wall-clock extent rather
+/// than as a slice of a serial pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Lane {
+    /// Sender writes the frame set to disk, before any transmission starts.
+    Generate,
+    /// Sender reads a frame back off disk.
+    Read,
+    /// Sender hands a frame to the transport.
+    Transmit,
+    /// Receiver pulls a frame off the transport.
+    Receive,
+    /// Receiver writes the frame to its own disk.
+    Write,
+}
+
+/// Live progress of one lifecycle lane, streamed while the run is happening so
+/// the Gantt builds up as work occurs instead of appearing at the end.
+///
+/// `start_ms` / `end_ms` are offsets from the reporting agent's run epoch. The
+/// sender and receiver have unsynchronised clocks, so the console anchors each
+/// end's timeline on arrival rather than trusting the two to share an origin —
+/// spacing within a end is exact, alignment across roles is approximate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaneUpdate {
+    pub run_id: String,
+    /// "send" or "recv" — whose clock `start_ms`/`end_ms` are on.
+    pub end: String,
+    pub lane: Lane,
+    /// Offset of the lane's first work, ms from that agent's run epoch.
+    pub start_ms: f64,
+    /// Offset of its most recent work. Equals "now" while the lane is active.
+    pub end_ms: f64,
+    /// Summed time workers actually spent inside this lane. Less than
+    /// `end_ms - start_ms` whenever the lane spends time waiting, which is how
+    /// you tell "slow" apart from "idle waiting on someone else".
+    pub busy_ms: f64,
+    /// Frames that have passed through this lane so far.
+    pub done: u64,
+    /// Frames expected, for a progress fraction. 0 when unbounded.
+    pub total: u64,
+    /// Set once the lane will do no more work.
+    pub complete: bool,
+}
+
 /// The per-phase latency breakdown that feeds the Gantt chart. Values are
-/// milliseconds measured on the source, offsets are from run start.
+/// milliseconds measured on the sender, offsets are from run start.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LatencyPhases {
@@ -405,15 +457,15 @@ pub struct LatencyPhases {
     pub ramp_ms: f64,
     pub steady_ms: f64,
     pub teardown_ms: f64,
-    /// Mean per-frame time the *source* spent in filesystem I/O (open+read+close).
+    /// Mean per-frame time the *sender* spent in filesystem I/O (open+read+close).
     /// Zero for large-file runs and near-zero in Memory storage mode — which is
     /// the point: it separates disk cost from wire cost on the Gantt.
     #[serde(default)]
-    pub src_io_ms: f64,
-    /// Mean per-frame time the *sink* spent in filesystem I/O (open+write+close),
-    /// reported by the sink's own summary and merged by the console.
+    pub send_io_ms: f64,
+    /// Mean per-frame time the *receiver* spent in filesystem I/O (open+write+close),
+    /// reported by the receiver's own summary and merged by the console.
     #[serde(default)]
-    pub sink_io_ms: f64,
+    pub recv_io_ms: f64,
     /// Mean per-frame time on the wire — whole-frame time minus both ends' I/O.
     #[serde(default)]
     pub net_ms: f64,
@@ -524,6 +576,11 @@ pub struct RunSummary {
     /// frametest report for multi-file runs; `None` for large-file runs.
     #[serde(default)]
     pub frame: Option<FrameStats>,
+    /// Final state of this end's lifecycle lanes. Repeats the last live
+    /// `Phase` update for each lane so a run reloaded from history renders the
+    /// same Gantt as one watched live.
+    #[serde(default)]
+    pub lanes: Vec<LaneUpdate>,
 }
 
 /// Messages the agent sends up to the console.
@@ -542,12 +599,14 @@ pub enum AgentMsg {
     Heartbeat {
         agent_id: String,
     },
-    /// Sink is listening and ready; console relays `listen_addr` to the source.
-    RoleReady {
+    /// Receiver is listening and ready; console relays `listen_addr` to the sender.
+    ReceiveReady {
         run_id: String,
         listen_addr: String,
     },
     Telemetry(TelemetrySample),
+    /// Live lifecycle-lane progress, so the Gantt fills in during the run.
+    Phase(LaneUpdate),
     RunComplete {
         summary: RunSummary,
     },
@@ -566,13 +625,13 @@ pub enum AgentMsg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum ConsoleMsg {
-    /// Become the sink for this run: bind a data-plane listener and reply RoleReady.
-    PrepareSink {
+    /// Become the receiver for this run: bind a data-plane listener and reply ReceiveReady.
+    PrepareReceive {
         run_id: String,
         scenario: Scenario,
     },
-    /// Become the source: connect to `target_addr` and run the scenario.
-    StartSource {
+    /// Become the sender: connect to `target_addr` and run the scenario.
+    StartSend {
         run_id: String,
         scenario: Scenario,
         target_addr: String,

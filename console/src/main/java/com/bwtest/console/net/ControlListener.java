@@ -10,6 +10,8 @@ public interface ControlListener {
                     String arch, String dataAddr, Capabilities caps);
     void onRoleReady(String runId, String listenAddr);
     void onTelemetry(Telemetry.Sample sample);
+    /** Live lifecycle-lane progress, so the Gantt fills in during the run. */
+    void onPhase(Telemetry.LaneUpdate update);
     void onRunComplete(Telemetry.Summary summary);
     void onRunError(String runId, String message);
     void onLog(String agentId, String level, String message);

@@ -82,10 +82,10 @@ public class FrameSpec {
     public int prebuffer = 5;
     public String order = FrameOrder.SEQUENTIAL.wire;
     public String storage = FrameStorage.DISK.wire;
-    /** Directory frames are read from / written to on the source. */
+    /** Directory frames are read from / written to on the sender. */
     public String path = "";
-    /** Where the sink writes received frames; empty = same as {@code path}. */
-    public String sinkPath = "";
+    /** Where the receiver writes received frames; empty = same as {@code path}. */
+    public String destPath = "";
     /** {@code --header} per-file header size in KB. */
     public int headerKb = 64;
     /** {@code -d} files per subdirectory; 0 = one flat directory. */

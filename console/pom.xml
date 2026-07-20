@@ -6,14 +6,25 @@
 
     <groupId>com.bwtest</groupId>
     <artifactId>bwconsole</artifactId>
-    <version>0.1.0</version>
+    <version>1.0.0</version>
     <packaging>jar</packaging>
     <name>Bandwidth Console</name>
     <description>Control plane and report nexus for the bwagent test surface.</description>
 
+    <licenses>
+        <license>
+            <name>MIT License</name>
+            <url>https://opensource.org/licenses/MIT</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <maven.compiler.release>23</maven.compiler.release>
+        <!-- 21, not 23: the installers bundle a JDK 21 LTS runtime, and jlink
+             refuses class files newer than the runtime being linked. JavaFX
+             stays at 23 because Gluon ships no linux-aarch64 jmods before it. -->
+        <maven.compiler.release>21</maven.compiler.release>
         <javafx.version>23.0.1</javafx.version>
         <jackson.version>2.18.2</jackson.version>
         <mainClass>com.bwtest.console.App</mainClass>
@@ -68,6 +79,12 @@
                         <phase>package</phase>
                         <goals><goal>shade</goal></goals>
                         <configuration>
+                            <!-- Repeated packaging runs (make deb, then make rpm)
+                                 invoke Maven twice. The reduced pom the shade
+                                 plugin writes is read back on the second run and
+                                 can fail it, so don't write one — nothing here
+                                 consumes it, and it was already gitignored. -->
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
                             <transformers>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                                     <mainClass>com.bwtest.console.Launcher</mainClass>

@@ -1,7 +1,7 @@
 //! QUIC data plane (always TLS 1.3, via quinn). The reference tool's headline
 //! protocol: QUIC vs TCP+SACK.
 //!
-//! The source opens unidirectional streams and blasts; the sink accepts and
+//! The sender opens unidirectional streams and blasts; the receiver accepts and
 //! drains them. `single_connection` decides whether all streams ride one
 //! connection (QUIC's multiplexing story) or each gets its own connection. RTT
 //! comes from quinn's own path estimate, and the QUIC/TLS handshake time is
@@ -45,9 +45,12 @@ fn client_endpoint(sc: &Scenario) -> Result<Endpoint> {
     }
 }
 
-/// Same for the sink side.
+/// Same for the receiver side.
 fn server_endpoint(sc: &Scenario, server_cfg: ServerConfig) -> Result<Endpoint> {
-    let bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
+    super::bind_recv(|bind| server_endpoint_at(sc, server_cfg.clone(), bind))
+}
+
+fn server_endpoint_at(sc: &Scenario, server_cfg: ServerConfig, bind: SocketAddr) -> Result<Endpoint> {
     if wants_dpdk(sc) {
         let socket = super::dpdk::DpdkUdpSocket::bind(bind)
             .with_context(|| format!("QUIC+DPDK: {}", super::dpdk::unavailable_reason()))?;
@@ -73,7 +76,7 @@ fn transport() -> Arc<TransportConfig> {
     Arc::new(t)
 }
 
-pub async fn run_source(
+pub async fn run_send(
     run_id: String,
     sc: Scenario,
     target_addr: String,
@@ -141,7 +144,38 @@ pub async fn run_source(
         let frames = frame::FrameCounters::new();
         let queue = frame::FrameQueue::new(plan.spec.queue_depth as usize);
         let frame_target = plan.total();
+        let lanes = frame::Lanes::new(frame_target);
         timer.first_byte_ms = first_rtt.load(Ordering::Relaxed) as f64 / 1000.0;
+
+        // Stage the frame set up front, same as the TCP path: the run measures
+        // moving frames, not creating them.
+        {
+            let (pl, ln, st, tx2, rid) =
+                (plan.clone(), lanes.clone(), stop.clone(), tx.clone(), run_id.clone());
+            let staged = tokio::task::spawn_blocking(move || {
+                // `None` until the first emission, so the opening 0/total goes out
+                // at once instead of waiting a tick.
+                let mut last: Option<Instant> = None;
+                let r = frame::pregenerate(&pl, &ln, &st, || {
+                    if last.is_none_or(|t| t.elapsed() >= Duration::from_millis(200)) {
+                        last = Some(Instant::now());
+                        if let Some(u) = ln.snapshot(frame::Lane::Generate, &rid, "send") {
+                            let _ = tx2.send(crate::protocol::AgentMsg::Phase(u));
+                        }
+                    }
+                });
+                r.map(|n| n).map_err(|e| e.to_string())
+            })
+            .await;
+            match staged {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => anyhow::bail!("stage frames: {e}"),
+                Err(e) => anyhow::bail!("stage frames: {e}"),
+            }
+            if let Some(u) = lanes.snapshot(frame::Lane::Generate, &run_id, "send") {
+                let _ = tx.send(crate::protocol::AgentMsg::Phase(u));
+            }
+        }
 
         let pacer = {
             let (pl, q, f, s) = (plan.clone(), queue.clone(), frames.clone(), stop.clone());
@@ -151,23 +185,24 @@ pub async fn run_source(
         let mut tasks = Vec::new();
         for idx in 0..streams {
             let conn = conns[idx % conns.len()].clone();
-            let (pl, q, f, c, s) = (
+            let (pl, q, f, c, l, s) = (
                 plan.clone(),
                 queue.clone(),
                 frames.clone(),
                 counters.clone(),
+                lanes.clone(),
                 stop.clone(),
             );
             tasks.push(tokio::spawn(async move {
-                frame_stream_worker(conn, idx, pl, q, f, c, s).await;
+                frame_stream_worker(conn, idx, pl, q, f, c, l, s).await;
             }));
         }
 
         let run_start = Instant::now();
         let (peak, avg, mut rtts) = super::sample_loop_frames(
-            run_id.clone(), "source", counters.clone(), stop.clone(), tx.clone(),
+            run_id.clone(), "send", counters.clone(), stop.clone(), tx.clone(),
             sc.duration_secs, sc.bytes_target, sc.continuous,
-            Some(frames.clone()), frame_target,
+            Some(frames.clone()), frame_target, Some(lanes.clone()),
         )
         .await;
 
@@ -186,11 +221,12 @@ pub async fn run_source(
         let elapsed = run_start.elapsed().as_secs_f64();
         timer.ramp_ms = 0.0;
         timer.steady_ms = elapsed * 1000.0;
+        lanes.finish_all();
 
         return Ok(timer.finish_frames(
             0, false, &run_id, peak, avg,
             counters.bytes.load(Ordering::Relaxed),
-            &mut rtts, &frames, elapsed,
+            &mut rtts, &frames, elapsed, &lanes,
         ));
     }
 
@@ -214,7 +250,7 @@ pub async fn run_source(
     timer.first_byte_ms = first_rtt.load(Ordering::Relaxed) as f64 / 1000.0;
 
     let (peak, avg, mut rtts) = sample_loop(
-        run_id.clone(), "source", counters.clone(), stop.clone(), tx.clone(),
+        run_id.clone(), "send", counters.clone(), stop.clone(), tx.clone(),
         sc.duration_secs, sc.bytes_target, sc.continuous,
     )
     .await;
@@ -248,6 +284,7 @@ async fn frame_stream_worker(
     queue: Arc<frame::FrameQueue>,
     frames: Arc<frame::FrameCounters>,
     counters: Arc<Counters>,
+    lanes: Arc<frame::Lanes>,
     stop: Stop,
 ) {
     let mut buf = frame::AlignedBuf::new(plan.spec.frame_bytes.max(1) as usize);
@@ -258,6 +295,7 @@ async fn frame_stream_worker(
         let frame_idx = plan.at(pos);
 
         let whole = Instant::now();
+        let read_from = lanes.now_ns();
         let (returned, res, mut t) = frame::load_frame_async(plan.clone(), frame_idx, buf).await;
         buf = returned;
         let payload = match res {
@@ -268,7 +306,12 @@ async fn frame_stream_worker(
                 continue;
             }
         };
+        lanes.read.mark(read_from, lanes.now_ns());
 
+        // Opening the stream counts as transmit: on QUIC that is part of what
+        // putting a frame on the wire costs, and it is the cost being compared
+        // against TCP's single ordered stream.
+        let wire_from = lanes.now_ns();
         let Ok(mut send) = conn.open_uni().await else { break };
         let hdr = frame::encode_header(frame_idx, payload as u32, 0);
         if send.write_all(&hdr).await.is_err() {
@@ -278,7 +321,10 @@ async fn frame_stream_worker(
             break;
         }
         let _ = send.finish();
+        let wire_to = lanes.now_ns();
+        lanes.transmit.mark(wire_from, wire_to);
 
+        t.wire_ns = wire_to.saturating_sub(wire_from);
         t.total_ns = whole.elapsed().as_nanos() as u64;
         t.bytes = payload as u64;
         frames.record_frame(&t);
@@ -286,7 +332,7 @@ async fn frame_stream_worker(
     }
 }
 
-pub async fn run_sink(run_id: String, sc: Scenario, tx: Tx) -> Result<(SocketAddr, Stop)> {
+pub async fn run_recv(run_id: String, sc: Scenario, tx: Tx) -> Result<(SocketAddr, Stop)> {
     let ss = crate::tls::self_signed()?;
     let rustls_cfg = crate::tls::server_config(&ss)?;
     let crypto = QuicServerConfig::try_from((*rustls_cfg).clone())?;
@@ -300,15 +346,23 @@ pub async fn run_sink(run_id: String, sc: Scenario, tx: Tx) -> Result<(SocketAdd
     let counters = Counters::new(sc.threads.max(1) as usize);
     let next_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-    // Multi-file: the sink measures what storing each received frame costs.
+    // Multi-file: the receiver measures what storing each received frame costs.
     let frame_ctx = if sc.is_multi_file() {
         let plan = frame::validate(&sc)?;
-        Some((plan.clone(), Arc::new(plan.spec.clone()), frame::FrameCounters::new()))
+        let total = plan.total();
+        Some((
+            plan.clone(),
+            Arc::new(plan.spec.clone()),
+            frame::FrameCounters::new(),
+            frame::Lanes::new(total),
+        ))
     } else {
         None
     };
-    let sink_frames = frame_ctx.as_ref().map(|(_, _, c)| c.clone());
-    super::spawn_sink_sampler_frames(run_id, counters.clone(), stop.clone(), tx, sink_frames);
+    let recv_frames = frame_ctx.as_ref().map(|(_, _, c, _)| c.clone());
+    let recv_lanes = frame_ctx.as_ref().map(|(_, _, _, l)| l.clone());
+    super::spawn_recv_sampler_frames(run_id, counters.clone(), stop.clone(), tx, recv_frames,
+                                     recv_lanes);
     let stop2 = stop.clone();
 
     tokio::spawn(async move {
@@ -339,6 +393,7 @@ type FrameCtx = (
     Arc<frame::FramePlan>,
     Arc<crate::protocol::FrameSpec>,
     Arc<frame::FrameCounters>,
+    Arc<frame::Lanes>,
 );
 
 async fn drain_conn(conn: quinn::Connection, stop: Stop, counters: Arc<Counters>,
@@ -359,8 +414,8 @@ async fn drain_conn(conn: quinn::Connection, stop: Stop, counters: Arc<Counters>
                     // One frame per stream: read it whole, then store it. The
                     // stream ending *is* the frame boundary, so unlike TCP there
                     // is no need to trust the header's length to reframe.
-                    if let Some((plan, spec, frames)) = fc {
-                        recv_frame_stream(recv, plan, spec, frames, c, idx).await;
+                    if let Some((plan, spec, frames, lanes)) = fc {
+                        recv_frame_stream(recv, plan, spec, frames, c, lanes, idx).await;
                         return;
                     }
                     let mut buf = vec![0u8; CHUNK];
@@ -384,13 +439,17 @@ async fn recv_frame_stream(
     spec: Arc<crate::protocol::FrameSpec>,
     frames: Arc<frame::FrameCounters>,
     counters: Arc<Counters>,
+    lanes: Arc<frame::Lanes>,
     idx: usize,
 ) {
     let cap = spec.frame_bytes as usize + frame::FRAME_HEADER_LEN;
     let whole = Instant::now();
+    let recv_from = lanes.now_ns();
     let Ok(data) = recv.read_to_end(cap).await else {
         return;
     };
+    let recv_to = lanes.now_ns();
+    lanes.receive.mark(recv_from, recv_to);
     if data.len() < frame::FRAME_HEADER_LEN {
         return;
     }
@@ -400,11 +459,13 @@ async fn recv_frame_stream(
     let payload = &data[frame::FRAME_HEADER_LEN..];
 
     let mut t = frame::FrameTiming::default();
+    t.wire_ns = recv_to.saturating_sub(recv_from);
     if matches!(spec.storage, crate::protocol::FrameStorage::Disk) {
-        let root = if spec.sink_path.is_empty() {
+        let write_from = lanes.now_ns();
+        let root = if spec.dest_path.is_empty() {
             &spec.path
         } else {
-            &spec.sink_path
+            &spec.dest_path
         };
         let path = plan.path_for(root, seq);
         let (sp, pay) = (spec.clone(), payload.to_vec());
@@ -415,14 +476,21 @@ async fn recv_frame_stream(
         })
         .await
         {
-            Ok(Ok(timing)) => t = timing,
+            Ok(Ok(timing)) => {
+                // `write_frame_file` builds a fresh timing, so re-attach the
+                // receive cost measured above rather than losing it.
+                let wire = t.wire_ns;
+                t = timing;
+                t.wire_ns = wire;
+            }
             Ok(Err(e)) => {
-                tracing::warn!("sink frame {seq}: {e:#}");
+                tracing::warn!("receiver frame {seq}: {e:#}");
                 frames.record_drop();
                 return;
             }
             Err(_) => return,
         }
+        lanes.write.mark(write_from, lanes.now_ns());
     }
 
     t.total_ns = whole.elapsed().as_nanos() as u64;

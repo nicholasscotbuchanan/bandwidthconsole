@@ -23,7 +23,7 @@ PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 9077
 
 agents = {}         # agentId -> dict(name, caps, conn)
 lock = threading.Lock()
-role_ready = {}     # runId -> listenAddr
+receive_ready = {}     # runId -> listenAddr
 telemetry = []      # samples
 summary = {}        # runId -> summary
 done = threading.Event()
@@ -47,9 +47,9 @@ def handle(conn):
             with lock:
                 agents[agent_id] = {"name": msg["name"], "caps": msg["capabilities"], "conn": conn}
             print(f"[register] {msg['name']} {msg['os']}/{msg['arch']} caps={msg['capabilities']}")
-        elif t == "roleReady":
-            role_ready[msg["runId"]] = msg["listenAddr"]
-            print(f"[roleReady] {msg['runId'][:8]} listen={msg['listenAddr']}")
+        elif t == "receiveReady":
+            receive_ready[msg["runId"]] = msg["listenAddr"]
+            print(f"[receiveReady] {msg['runId'][:8]} listen={msg['listenAddr']}")
         elif t == "telemetry":
             s = msg
             telemetry.append(s)
@@ -96,18 +96,18 @@ def main():
         print("ERROR: need 2 agents")
         sys.exit(2)
 
-    # Roles default to registration order, but can be pinned by agent name --
+    # Ends default to registration order, but can be pinned by agent name --
     # which matters when one side must start first (e.g. the memif server).
     import os as _os
-    want_src = _os.environ.get("SC_SOURCE_NAME")
-    want_sink = _os.environ.get("SC_SINK_NAME")
-    source_id, sink_id = ids[0], ids[1]
-    if want_src or want_sink:
+    want_from = _os.environ.get("SC_FROM_NAME")
+    want_to = _os.environ.get("SC_TO_NAME")
+    from_id, to_id = ids[0], ids[1]
+    if want_from or want_to:
         by_name = {a["name"]: aid for aid, a in agents.items()}
-        source_id = by_name.get(want_src, source_id)
-        sink_id = by_name.get(want_sink, sink_id)
-        if source_id == sink_id:
-            print(f"ERROR: source and sink resolved to the same agent")
+        from_id = by_name.get(want_from, from_id)
+        to_id = by_name.get(want_to, to_id)
+        if from_id == to_id:
+            print(f"ERROR: sender and receiver resolved to the same agent")
             sys.exit(6)
     import os
     scenario = {
@@ -140,25 +140,25 @@ def main():
             "order": os.environ.get("SC_ORDER", "Sequential"),
             "storage": os.environ.get("SC_STORAGE", "Memory"),
             "path": os.environ.get("SC_FRAME_PATH", ""),
-            "sinkPath": os.environ.get("SC_SINK_PATH", ""),
+            "destPath": os.environ.get("SC_DEST_PATH", ""),
             "headerKb": int(os.environ.get("SC_HEADER_KB", "64")),
             "directIo": os.environ.get("SC_DIRECT", "1") == "1",
         }
     run_id = str(uuid.uuid4())
-    print(f"\n== run {run_id[:8]}  source={agents[source_id]['name']} -> sink={agents[sink_id]['name']} ==")
-    send(agents[sink_id]["conn"], {"type": "prepareSink", "runId": run_id, "scenario": scenario})
+    print(f"\n== run {run_id[:8]}  sender={agents[from_id]['name']} -> receiver={agents[to_id]['name']} ==")
+    send(agents[to_id]["conn"], {"type": "prepareReceive", "runId": run_id, "scenario": scenario})
 
     for _ in range(100):
-        if run_id in role_ready:
+        if run_id in receive_ready:
             break
         time.sleep(0.05)
-    if run_id not in role_ready:
-        print("ERROR: sink never became ready")
+    if run_id not in receive_ready:
+        print("ERROR: receiver never became ready")
         sys.exit(3)
 
-    send(agents[source_id]["conn"], {
-        "type": "startSource", "runId": run_id,
-        "scenario": scenario, "targetAddr": role_ready[run_id],
+    send(agents[from_id]["conn"], {
+        "type": "startSend", "runId": run_id,
+        "scenario": scenario, "targetAddr": receive_ready[run_id],
     })
 
     if not done.wait(timeout=30):
@@ -197,10 +197,10 @@ def main():
             sys.exit(11)
         # The I/O split is what the Gantt's band draws; it must be populated.
         ph = s["phases"]
-        print(f"    per frame: {ph['srcIoMs']:.2f} ms source I/O, "
+        print(f"    per frame: {ph['sendIoMs']:.2f} ms sender I/O, "
               f"{ph['netMs']:.2f} ms wire")
-        if ph["srcIoMs"] <= 0 and scenario["frame"]["storage"] == "Disk":
-            print("ERROR: Disk storage reported no source I/O time")
+        if ph["sendIoMs"] <= 0 and scenario["frame"]["storage"] == "Disk":
+            print("ERROR: Disk storage reported no sender I/O time")
             sys.exit(12)
     sys.exit(0)
 

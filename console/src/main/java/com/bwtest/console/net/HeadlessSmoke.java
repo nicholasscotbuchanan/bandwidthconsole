@@ -40,12 +40,21 @@ public class HeadlessSmoke {
                 twoAgents.countDown();
             }
             @Override public void onRoleReady(String rid, String listenAddr) {
-                System.out.println("[roleReady] listen=" + listenAddr);
-                conns.get(0).startSource(rid, scenario(), listenAddr); // conns[0]=source
+                // conns[1]=receiver; mirror the Orchestrator and offer its observed
+                // control-plane address as a fallback candidate.
+                String target = AgentConnection.withFallback(
+                        listenAddr, conns.get(1).peerHost(), false);
+                System.out.println("[receiveReady] listen=" + listenAddr + " target=" + target);
+                conns.get(0).startSend(rid, scenario(), target); // conns[0]=sender
             }
             @Override public void onTelemetry(Telemetry.Sample s) {
                 System.out.printf("  t=%.1fs  %.1f Mbps  rtt=%.2fms  retx=%d%n",
                         s.tSecs(), s.mbps(), s.rttMs(), s.retransmits());
+            }
+            @Override public void onPhase(Telemetry.LaneUpdate u) {
+                System.out.printf("  [%s] %-9s %,d/%,d  %s/frame%s%n", u.end(), u.lane().wire,
+                        u.done(), u.total(), String.format("%.2fms", u.perFrameMs()),
+                        u.complete() ? "  done" : "");
             }
             @Override public void onRunComplete(Telemetry.Summary s) {
                 System.out.printf("[runComplete] avg=%.1f peak=%.1f Mbps  p95rtt=%.2fms  "
@@ -69,8 +78,8 @@ public class HeadlessSmoke {
         System.out.println("headless console on tcp/" + port + "; waiting for 2 agents...");
         if (!twoAgents.await(20, TimeUnit.SECONDS)) { System.out.println("ERROR: <2 agents"); System.exit(2); }
 
-        // conns[1] = sink, conns[0] = source (fixed by index for determinism).
-        conns.get(1).prepareSink(runId, scenario());
+        // conns[1] = receiver, conns[0] = sender (fixed by index for determinism).
+        conns.get(1).prepareReceive(runId, scenario());
         if (!runDone.await(30, TimeUnit.SECONDS)) { System.out.println("ERROR: timeout"); System.exit(4); }
         server.stop();
         System.out.println(ok[0] ? "OK: Java layer parsed a full run" : "ERROR: zero throughput");
@@ -78,8 +87,30 @@ public class HeadlessSmoke {
     }
 
     private static Scenario scenario() {
-        return Scenario.of(com.bwtest.console.model.Protocol.TCP,
+        Scenario sc = Scenario.of(com.bwtest.console.model.Protocol.TCP,
                 com.bwtest.console.model.Architecture.SELECTOR,
                 4, 1, 0, false, 32768, 0, 4);
+        // BW_SMOKE_FRAMES=<dir> drives a multi-file run instead, which is the
+        // only way to exercise up-front staging and the lifecycle-lane stream
+        // over the real wire format rather than against seeded fixtures.
+        String dir = System.getenv("BW_SMOKE_FRAMES");
+        if (dir == null || dir.isBlank()) return sc;
+
+        com.bwtest.console.model.FrameSpec f = new com.bwtest.console.model.FrameSpec();
+        f.mode = com.bwtest.console.model.FrameMode.WRITE.wire;
+        // Tunable so a run can be made long enough to prove that staging reports
+        // progress *while* it works rather than only when it finishes.
+        f.frameBytes = Long.parseLong(env("BW_SMOKE_FRAME_BYTES", String.valueOf(1 << 20)));
+        f.frameCount = Long.parseLong(env("BW_SMOKE_FRAME_COUNT", "40"));
+        f.path = dir + "/src";
+        f.destPath = dir + "/receiver";
+        f.headerKb = 0;
+        f.directIo = false;       // temp filesystems often refuse O_DIRECT
+        return sc.withFrames(f);
+    }
+
+    private static String env(String k, String dflt) {
+        String v = System.getenv(k);
+        return v == null || v.isBlank() ? dflt : v;
     }
 }

@@ -1,9 +1,9 @@
 //! UDP data plane with lightweight receiver feedback.
 //!
-//! Every datagram carries `[send_ts:8][seq:8][payload…]`. The sink tallies each
+//! Every datagram carries `[send_ts:8][seq:8][payload…]`. The receiver tallies each
 //! source address and, four times a second, mails back
 //! `[bytes_cum:8][pkts_cum:8][echo_ts:8][high_seq:8]`. That feedback lets the
-//! source report *delivered* goodput (not just offered load), packet loss, and a
+//! sender report *delivered* goodput (not just offered load), packet loss, and a
 //! real RTT proxy — so UDP numbers are as honest as the TCP ones.
 
 use std::collections::HashMap;
@@ -25,7 +25,7 @@ fn now_nanos() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
 }
 
-fn make_source_socket(target: SocketAddr, sc: &Scenario) -> Result<UdpSocket> {
+fn make_send_socket(target: SocketAddr, sc: &Scenario) -> Result<UdpSocket> {
     let sock = Socket::new(Domain::for_address(target), Type::DGRAM, Some(L4::UDP))?;
     super::apply_dscp(&sock, sc)?;
     sock.set_send_buffer_size(4 * 1024 * 1024).ok();
@@ -35,9 +35,9 @@ fn make_source_socket(target: SocketAddr, sc: &Scenario) -> Result<UdpSocket> {
     Ok(sock.into())
 }
 
-/// One source stream: blast datagrams, absorb feedback, keep the shared counters
+/// One sender stream: blast datagrams, absorb feedback, keep the shared counters
 /// reflecting *delivered* bytes/packets/loss/RTT.
-fn source_stream(
+fn send_stream(
     sock: UdpSocket,
     target: SocketAddr,
     payload_len: usize,
@@ -110,7 +110,7 @@ fn source_stream(
                 // Loss = sent - delivered (monotonic, clamp).
                 let lost = seq.saturating_sub(d_pkts);
                 counters.retransmits.store(lost, Ordering::Relaxed);
-                // RTT proxy: time since the send that the sink last acknowledged.
+                // RTT proxy: time since the send that the receiver last acknowledged.
                 let rtt = now_nanos().saturating_sub(echo_ts) / 1000;
                 if rtt > 0 && rtt < 60_000_000 {
                     counters.rtt_us.store(rtt, Ordering::Relaxed);
@@ -121,7 +121,7 @@ fn source_stream(
     }
 }
 
-pub async fn run_source(
+pub async fn run_send(
     run_id: String,
     sc: Scenario,
     target_addr: String,
@@ -142,13 +142,13 @@ pub async fn run_source(
     timer.connect_ms = timer.elapsed_ms();
     let mut handles = Vec::new();
     for idx in 0..threads as usize {
-        let sock = make_source_socket(target, &sc)?;
+        let sock = make_send_socket(target, &sc)?;
         let (c, s, fr) = (counters.clone(), stop.clone(), first_rtt.clone());
         let plen = sc.payload_bytes.max(HDR as u32) as usize;
         // Threaded and Selector both spin a stream loop; UDP has no accept/reactor
         // asymmetry to exploit, so the honest difference is only thread count.
         handles.push(std::thread::spawn(move || {
-            source_stream(sock, target, plen, per_stream_mbps, idx, c, s, fr)
+            send_stream(sock, target, plen, per_stream_mbps, idx, c, s, fr)
         }));
     }
     timer.handshake_ms = timer.elapsed_ms();
@@ -162,7 +162,7 @@ pub async fn run_source(
     timer.first_byte_ms = first_rtt.load(Ordering::Relaxed) as f64 / 1000.0;
 
     let (peak, avg, mut rtts) = sample_loop(
-        run_id.clone(), "source", counters.clone(), stop.clone(), tx.clone(),
+        run_id.clone(), "send", counters.clone(), stop.clone(), tx.clone(),
         sc.duration_secs, sc.bytes_target, sc.continuous,
     )
     .await;
@@ -182,22 +182,24 @@ pub async fn run_source(
     Ok(timer.finish(retransmits, false, &run_id, peak, avg, bytes, &mut rtts))
 }
 
-/// Sink: one socket, per-source tallies, feedback flushed 4×/second.
-pub async fn run_sink(run_id: String, sc: Scenario, tx: Tx) -> Result<(SocketAddr, Stop)> {
-    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(L4::UDP))?;
-    sock.set_reuse_address(true)?;
-    super::apply_dscp(&sock, &sc)?;
-    sock.set_recv_buffer_size(8 * 1024 * 1024).ok();
-    sock.bind(&"0.0.0.0:0".parse::<SocketAddr>().unwrap().into())?;
-    let sock: UdpSocket = sock.into();
+/// Receiver: one socket, per-sender tallies, feedback flushed 4×/second.
+pub async fn run_recv(run_id: String, sc: Scenario, tx: Tx) -> Result<(SocketAddr, Stop)> {
+    let sock: UdpSocket = super::bind_recv(|bind| {
+        let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(L4::UDP))?;
+        sock.set_reuse_address(true)?;
+        super::apply_dscp(&sock, &sc)?;
+        sock.set_recv_buffer_size(8 * 1024 * 1024).ok();
+        sock.bind(&bind.into())?;
+        Ok(sock.into())
+    })?;
     let local = sock.local_addr()?;
     sock.set_read_timeout(Some(Duration::from_millis(50)))?;
 
     let stop: Stop = Arc::new(AtomicBool::new(false));
-    // Sink-side goodput accounting: each source stream is its own socket, so
+    // Receiver-side goodput accounting: each sender stream is its own socket, so
     // peers map 1:1 to streams; slots are claimed in arrival order.
     let counters = Counters::new(sc.threads.max(1) as usize);
-    super::spawn_sink_sampler(run_id, counters.clone(), stop.clone(), tx);
+    super::spawn_recv_sampler(run_id, counters.clone(), stop.clone(), tx);
     let stop2 = stop.clone();
     std::thread::spawn(move || {
         #[derive(Default, Clone)]

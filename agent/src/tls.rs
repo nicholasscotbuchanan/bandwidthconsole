@@ -1,7 +1,7 @@
 //! Shared TLS 1.3 material for the encrypted data paths (TCP+TLS and QUIC).
 //!
-//! This is a *benchmark* surface: the sink mints a fresh self-signed certificate
-//! per process and the source accepts any certificate. That keeps the handshake
+//! This is a *benchmark* surface: the receiver mints a fresh self-signed certificate
+//! per process and the sender accepts any certificate. That keeps the handshake
 //! real (TLS 1.3, measured in the Gantt) without a PKI to provision — which is
 //! exactly what a throughput comparator wants. It is deliberately NOT suitable
 //! for anything but testing.
@@ -14,7 +14,7 @@ use rustls::{ClientConfig, ServerConfig};
 
 pub const ALPN: &[u8] = b"bwtest";
 
-/// A self-signed cert + key for the sink, in DER.
+/// A self-signed cert + key for the receiver, in DER.
 pub struct SelfSigned {
     pub cert: CertificateDer<'static>,
     pub key: PrivateKeyDer<'static>,
@@ -32,7 +32,7 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-/// Server config for the sink (single self-signed cert, ALPN set). TLS 1.3 only,
+/// Server config for the receiver (single self-signed cert, ALPN set). TLS 1.3 only,
 /// which both the TCP+TLS path and QUIC (which requires 1.3) share.
 pub fn server_config(ss: &SelfSigned) -> Result<Arc<ServerConfig>> {
     let mut cfg = ServerConfig::builder_with_provider(provider())
@@ -43,7 +43,7 @@ pub fn server_config(ss: &SelfSigned) -> Result<Arc<ServerConfig>> {
     Ok(Arc::new(cfg))
 }
 
-/// Client config for the source: verifies nothing (bench), ALPN set, TLS 1.3.
+/// Client config for the sender: verifies nothing (bench), ALPN set, TLS 1.3.
 pub fn client_config() -> Arc<ClientConfig> {
     let mut cfg = ClientConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])

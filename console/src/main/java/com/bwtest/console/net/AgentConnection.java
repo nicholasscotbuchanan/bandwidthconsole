@@ -31,6 +31,50 @@ public class AgentConnection {
 
     public String agentId() { return agentId; }
 
+    /**
+     * The address this agent's control connection came from. The agent's own
+     * advertised address is a guess about how others reach it; this is observed
+     * fact, so it makes a good fallback when that guess does not resolve.
+     */
+    public String peerHost() {
+        java.net.InetAddress a = socket.getInetAddress();
+        return a == null ? null : a.getHostAddress();
+    }
+
+    /**
+     * Append {@code peerHost} to a receiver's candidate list, so a receiver advertising
+     * a host its peers cannot resolve (a container name, or a stale
+     * {@code --advertise}) still gets connected to. The agent tries candidates
+     * left to right and takes the first that answers.
+     *
+     * <p>{@code listenAddr} is itself a comma-separated list: an agent knows it
+     * may be reachable by several names at once and says so. We append rather
+     * than replace, and skip a candidate whose host we already have — the
+     * common case is a receiver whose advertised address and observed address are
+     * the same, where a duplicate would just cost a probe.
+     *
+     * <p>Returns {@code listenAddr} unchanged when {@code requiresDpdk}: there
+     * the receiver listens on its own userspace stack, and the control-plane address
+     * would reach the kernel — a fallback would hit the wrong network entirely.
+     */
+    public static String withFallback(String listenAddr, String peerHost, boolean requiresDpdk) {
+        if (requiresDpdk || listenAddr == null || listenAddr.isBlank()) return listenAddr;
+        if (peerHost == null || peerHost.isBlank()) return listenAddr;
+
+        java.util.LinkedHashSet<String> candidates = new java.util.LinkedHashSet<>();
+        String port = null;
+        for (String c : listenAddr.split(",")) {
+            c = c.strip();
+            if (c.isEmpty()) continue;
+            candidates.add(c);
+            int colon = c.lastIndexOf(':');
+            if (colon >= 0) port = c.substring(colon);
+        }
+        if (candidates.isEmpty() || port == null) return listenAddr;
+        candidates.add(peerHost + port);
+        return String.join(",", candidates);
+    }
+
     /** Blocking read loop; run on its own thread. */
     public void run() {
         try (BufferedReader in = new BufferedReader(
@@ -59,7 +103,7 @@ public class AgentConnection {
                         n.path("dataAddr").asText(), c);
             }
             case "heartbeat" -> { /* liveness only */ }
-            case "roleReady" ->
+            case "receiveReady" ->
                     listener.onRoleReady(n.path("runId").asText(), n.path("listenAddr").asText());
             case "telemetry" -> {
                 java.util.List<Double> per = new java.util.ArrayList<>();
@@ -68,12 +112,18 @@ public class AgentConnection {
                 }
                 listener.onTelemetry(new Telemetry.Sample(
                         n.path("runId").asText(),
-                        n.path("role").asText("source"),
+                        n.path("end").asText("send"),
                         n.path("tSecs").asDouble(),
                         n.path("mbps").asDouble(), n.path("pps").asDouble(),
                         n.path("rttMs").asDouble(), n.path("retransmits").asLong(),
                         n.path("cpuPercent").asDouble(), per,
                         parseFrameProgress(n.path("frame"))));
+            }
+            case "phase" -> {
+                Telemetry.LaneUpdate u = parseLane(n);
+                // An agent newer than this console could name a lane we don't
+                // know; skipping it beats drawing an unlabelled bar.
+                if (u != null) listener.onPhase(u);
             }
             case "runComplete" -> listener.onRunComplete(parseSummary(n.path("summary")));
             case "runError" ->
@@ -94,13 +144,25 @@ public class AgentConnection {
                 f.path("closeMsAvg").asDouble());
     }
 
+    /** One lifecycle-lane update. Null when the lane name isn't one we know. */
+    private static Telemetry.LaneUpdate parseLane(JsonNode n) {
+        if (n == null || n.isMissingNode() || n.isNull()) return null;
+        Telemetry.Lane lane = Telemetry.Lane.fromWire(n.path("lane").asText());
+        if (lane == null) return null;
+        return new Telemetry.LaneUpdate(
+                n.path("runId").asText(), n.path("end").asText("send"), lane,
+                n.path("startMs").asDouble(), n.path("endMs").asDouble(),
+                n.path("busyMs").asDouble(), n.path("done").asLong(),
+                n.path("total").asLong(), n.path("complete").asBoolean());
+    }
+
     private Telemetry.Summary parseSummary(JsonNode s) {
         JsonNode p = s.path("phases");
         Telemetry.Phases phases = new Telemetry.Phases(
                 p.path("connectMs").asDouble(), p.path("handshakeMs").asDouble(),
                 p.path("firstByteMs").asDouble(), p.path("rampMs").asDouble(),
                 p.path("steadyMs").asDouble(), p.path("teardownMs").asDouble(),
-                p.path("srcIoMs").asDouble(), p.path("sinkIoMs").asDouble(),
+                p.path("sendIoMs").asDouble(), p.path("recvIoMs").asDouble(),
                 p.path("netMs").asDouble());
         return new Telemetry.Summary(
                 s.path("runId").asText(), s.path("avgMbps").asDouble(),
@@ -108,7 +170,19 @@ public class AgentConnection {
                 s.path("p50RttMs").asDouble(), s.path("p95RttMs").asDouble(),
                 s.path("p99RttMs").asDouble(), s.path("retransmits").asLong(),
                 s.path("sackActive").asBoolean(), phases,
-                parseFrameStats(s.path("frame")));
+                parseFrameStats(s.path("frame")), parseLanes(s.path("lanes")));
+    }
+
+    /** The sender's final lane states, repeated in the summary so a completed
+     *  run renders the same Gantt as one that was watched live. */
+    private static java.util.List<Telemetry.LaneUpdate> parseLanes(JsonNode a) {
+        java.util.List<Telemetry.LaneUpdate> out = new java.util.ArrayList<>();
+        if (a == null || !a.isArray()) return out;
+        for (JsonNode n : a) {
+            Telemetry.LaneUpdate u = parseLane(n);
+            if (u != null) out.add(u);
+        }
+        return out;
     }
 
     private static Telemetry.Stage parseStage(JsonNode n) {
@@ -140,17 +214,17 @@ public class AgentConnection {
 
     // --- outbound commands ---
 
-    public void prepareSink(String runId, Scenario sc) {
+    public void prepareReceive(String runId, Scenario sc) {
         ObjectNode m = M.createObjectNode();
-        m.put("type", "prepareSink");
+        m.put("type", "prepareReceive");
         m.put("runId", runId);
         m.set("scenario", M.valueToTree(sc));
         send(m);
     }
 
-    public void startSource(String runId, Scenario sc, String targetAddr) {
+    public void startSend(String runId, Scenario sc, String targetAddr) {
         ObjectNode m = M.createObjectNode();
-        m.put("type", "startSource");
+        m.put("type", "startSend");
         m.put("runId", runId);
         m.set("scenario", M.valueToTree(sc));
         m.put("targetAddr", targetAddr);

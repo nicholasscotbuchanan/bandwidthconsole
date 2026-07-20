@@ -10,18 +10,18 @@ import javafx.scene.text.Text;
 import java.util.List;
 
 /**
- * Right live view: goodput vs throughput — is the sink keeping up with the
- * source?
+ * Right live view: goodput vs throughput — is the receiver keeping up with the
+ * sender?
  *
  *   X — time, newest column on the right
- *   Z — two rows: SENT (source, offered throughput) behind,
- *       RECEIVED (sink, delivered goodput) in front
+ *   Z — two rows: SENT (sender, offered throughput) behind,
+ *       RECEIVED (receiver, delivered goodput) in front
  *   Y — Mbit/s
  *
  * When the pairs match height the path is clean; a front row persistently
  * shorter than the back row is bandwidth lost between the ends (loss, queue
  * collapse, a receiver that can't drain). The received row is tinted by that
- * ratio — teal when balanced, amber when slipping, red when the sink is
+ * ratio — teal when balanced, amber when slipping, red when the receiver is
  * drowning.
  */
 public class Balance3D extends Live3DPane {
@@ -42,7 +42,7 @@ public class Balance3D extends Live3DPane {
             caption.setText("waiting for a running test…");
             return;
         }
-        List<Telemetry.Sample> snk = run.sinkSamples;
+        List<Telemetry.Sample> snk = run.recvSamples;
 
         int from = Math.max(0, src.size() - WINDOW);
         List<Telemetry.Sample> window = src.subList(from, src.size());
@@ -75,12 +75,12 @@ public class Balance3D extends Live3DPane {
         }
 
         if (snk.isEmpty()) {
-            caption.setText("no sink telemetry — agents predate the balance feed?");
+            caption.setText("no receiver telemetry — agents predate the balance feed?");
         } else {
             double balance = sentSum > 1e-9 ? clamp(recvSum / sentSum, 0, 1.5) * 100 : 100;
             caption.setText(String.format("sent %s · received %s · balance %.1f%%  (%s)",
                     fmt(sentSum / Math.max(1, cols)), fmt(recvSum / Math.max(1, cols)),
-                    balance, run.sourceName + " → " + run.sinkName));
+                    balance, run.fromName + " → " + run.toName));
         }
 
         Text sentLbl = flatText("sent", "#7ea6d8", 20);
@@ -106,15 +106,15 @@ public class Balance3D extends Live3DPane {
         content.getChildren().add(surface(curtain, xL, xR, z - half, z - half, side));
     }
 
-    /** Sink sample nearest in run-time to `t`, or -1 when none is close enough. */
-    private static double nearestMbps(List<Telemetry.Sample> sink, double t) {
+    /** Receiver sample nearest in run-time to `t`, or -1 when none is close enough. */
+    private static double nearestMbps(List<Telemetry.Sample> receiver, double t) {
         double best = -1, bestDt = 0.6; // pair only within ~3 sample periods
-        for (int i = sink.size() - 1; i >= 0; i--) {
-            double dt = Math.abs(sink.get(i).tSecs() - t);
+        for (int i = receiver.size() - 1; i >= 0; i--) {
+            double dt = Math.abs(receiver.get(i).tSecs() - t);
             if (dt < bestDt) {
                 bestDt = dt;
-                best = sink.get(i).mbps();
-            } else if (sink.get(i).tSecs() < t - 1.0) {
+                best = receiver.get(i).mbps();
+            } else if (receiver.get(i).tSecs() < t - 1.0) {
                 break; // sorted by time; nothing older will be closer
             }
         }

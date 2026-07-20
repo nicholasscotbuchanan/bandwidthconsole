@@ -1,11 +1,11 @@
-//! TCP data plane, optionally wrapped in TLS 1.3. Single-process source and sink;
+//! TCP data plane, optionally wrapped in TLS 1.3. Single-process sender and receiver;
 //! multi-process fan-out lives in `procgroup`.
 //!
 //! Architectures (the fork the tool measures):
 //!  * **Threaded** — one blocking OS thread per connection (`std::net`).
 //!  * **Selector** — async tasks on the shared tokio reactor (epoll/kqueue).
 //!
-//! When `scenario.tls` is set, every connection (blast + probe + sink) runs over
+//! When `scenario.tls` is set, every connection (blast + probe + receiver) runs over
 //! rustls TLS 1.3, so the handshake shows up in the Gantt and throughput reflects
 //! encryption cost. Plain and TLS share the worker code via boxed IO traits.
 
@@ -81,7 +81,7 @@ async fn blast_task(mut io: Box<dyn AsyncIo>, idx: usize, payload: Arc<Vec<u8>>,
     let _ = io.shutdown().await;
 }
 
-/// Multi-file source worker: pull paced frames off the queue and push each one
+/// Multi-file sender worker: pull paced frames off the queue and push each one
 /// down this connection with its header. All the frametest behaviour lives in
 /// `engine::frame`; this is only the transport binding.
 fn frame_thread(
@@ -91,10 +91,11 @@ fn frame_thread(
     queue: Arc<frame::FrameQueue>,
     frames: Arc<frame::FrameCounters>,
     c: Arc<Counters>,
+    lanes: Arc<frame::Lanes>,
     stop: Stop,
 ) {
     let _ = io.write_all(&[ROLE_FRAME]);
-    frame::source_frame_worker(plan, queue, frames, c, idx, io, stop);
+    frame::send_frame_worker(plan, queue, frames, c, lanes, idx, io, stop);
 }
 
 fn probe_worker(mut io: Box<dyn SyncIo>, c: Arc<Counters>, stop: Stop, first_rtt: Arc<AtomicU64>) {
@@ -116,14 +117,14 @@ fn probe_worker(mut io: Box<dyn SyncIo>, c: Arc<Counters>, stop: Stop, first_rtt
     }
 }
 
-pub async fn run_source(
+pub async fn run_send(
     run_id: String,
     sc: Scenario,
     target_addr: String,
     tx: Tx,
     stop: Stop,
 ) -> Result<crate::protocol::RunSummary> {
-    let addr: SocketAddr = super::resolve(&target_addr)?;
+    let addr: SocketAddr = super::resolve_connectable(&target_addr)?;
     let threads = sc.threads.max(1) as usize;
     let counters = Counters::new(threads);
     let mut timer = PhaseTimer::start();
@@ -152,20 +153,60 @@ pub async fn run_source(
         let frames = frame::FrameCounters::new();
         let queue = frame::FrameQueue::new(plan.spec.queue_depth as usize);
         let frame_target = plan.total();
+        let lanes = frame::Lanes::new(frame_target);
+
+        // Stage the frame set before anything is transmitted, so what follows
+        // measures moving frames rather than creating them. Progress streams as
+        // it goes: staging a large set takes real time and the console should
+        // show it happening, not appear to hang before the run starts.
+        // Staging is blocking file I/O and can run for minutes on a large set,
+        // so it goes to a blocking thread — same as the QUIC path. Run inline it
+        // would hold a tokio worker for the whole phase and stall the telemetry
+        // it is trying to report.
+        {
+            let (pl, ln, st, tx2, rid) =
+                (plan.clone(), lanes.clone(), stop.clone(), tx.clone(), run_id.clone());
+            let staged = tokio::task::spawn_blocking(move || {
+                // `None` until the first emission, so the opening 0/total goes out
+                // at once instead of waiting a tick.
+                let mut last: Option<Instant> = None;
+                let r = frame::pregenerate(&pl, &ln, &st, || {
+                    // Throttled to the sampler's cadence; per-frame emission would
+                    // flood the control channel on a small-frame run.
+                    if last.is_none_or(|t| t.elapsed() >= Duration::from_millis(200)) {
+                        last = Some(Instant::now());
+                        if let Some(u) = ln.snapshot(frame::Lane::Generate, &rid, "send") {
+                            let _ = tx2.send(crate::protocol::AgentMsg::Phase(u));
+                        }
+                    }
+                });
+                r.map_err(|e| e.to_string())
+            })
+            .await;
+            match staged {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => anyhow::bail!("stage frames: {e}"),
+                Err(e) => anyhow::bail!("stage frames: {e}"),
+            }
+            if let Some(u) = lanes.snapshot(frame::Lane::Generate, &run_id, "send") {
+                let _ = tx.send(crate::protocol::AgentMsg::Phase(u));
+            }
+        }
 
         let mut workers = Vec::new();
         let connect_start = Instant::now();
         for idx in 0..threads {
             let io = client_sync(connect(addr, &sc)?, sc.tls)?;
-            let (pl, q, f, c, s) = (
+            let (pl, q, f, c, l, s) = (
                 plan.clone(),
                 queue.clone(),
                 frames.clone(),
                 counters.clone(),
+                lanes.clone(),
                 stop.clone(),
             );
             workers.push(std::thread::spawn(move || {
-                frame_thread(io, idx, pl, q, f, c, s)
+                frame_thread(io, idx, pl, q, f, c, l, s)
             }));
         }
         timer.connect_ms = connect_start.elapsed().as_secs_f64() * 1000.0;
@@ -178,9 +219,9 @@ pub async fn run_source(
 
         let run_start = Instant::now();
         let (peak, avg, mut rtts) = super::sample_loop_frames(
-            run_id.clone(), "source", counters.clone(), stop.clone(), tx.clone(),
+            run_id.clone(), "send", counters.clone(), stop.clone(), tx.clone(),
             sc.duration_secs, sc.bytes_target, sc.continuous,
-            Some(frames.clone()), frame_target,
+            Some(frames.clone()), frame_target, Some(lanes.clone()),
         )
         .await;
 
@@ -195,6 +236,7 @@ pub async fn run_source(
         let elapsed = run_start.elapsed().as_secs_f64();
         timer.ramp_ms = 0.0;
         timer.steady_ms = elapsed * 1000.0;
+        lanes.finish_all();
 
         return Ok(timer.finish_frames(
             counters.retransmits.load(Ordering::Relaxed),
@@ -206,6 +248,7 @@ pub async fn run_source(
             &mut rtts,
             &frames,
             elapsed,
+            &lanes,
         ));
     }
 
@@ -245,7 +288,7 @@ pub async fn run_source(
     timer.first_byte_ms = first_rtt.load(Ordering::Relaxed) as f64 / 1000.0;
 
     let (peak, avg, mut rtts) = sample_loop(
-        run_id.clone(), "source", counters.clone(), stop.clone(), tx.clone(),
+        run_id.clone(), "send", counters.clone(), stop.clone(), tx.clone(),
         sc.duration_secs, sc.bytes_target, sc.continuous,
     )
     .await;
@@ -267,14 +310,15 @@ pub async fn run_source(
     Ok(timer.finish(retransmits, sack_active(), &run_id, peak, avg, bytes, &mut rtts))
 }
 
-pub async fn run_sink(run_id: String, sc: Scenario, tx: Tx) -> Result<(SocketAddr, Stop)> {
-    let bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
-    let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(L4::TCP))?;
-    sock.set_reuse_address(true)?;
-    super::apply_dscp(&sock, &sc)?;
-    sock.bind(&bind.into())?;
-    sock.listen(1024)?;
-    let listener: std::net::TcpListener = sock.into();
+pub async fn run_recv(run_id: String, sc: Scenario, tx: Tx) -> Result<(SocketAddr, Stop)> {
+    let listener: std::net::TcpListener = super::bind_recv(|bind| {
+        let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(L4::TCP))?;
+        sock.set_reuse_address(true)?;
+        super::apply_dscp(&sock, &sc)?;
+        sock.bind(&bind.into())?;
+        sock.listen(1024)?;
+        Ok(sock.into())
+    })?;
     let local = listener.local_addr()?;
     listener.set_nonblocking(false)?;
 
@@ -288,21 +332,29 @@ pub async fn run_sink(run_id: String, sc: Scenario, tx: Tx) -> Result<(SocketAdd
 
     let stop: Stop = Arc::new(AtomicBool::new(false));
     // Delivered-goodput accounting: every blast connection claims the next
-    // stream slot, and the sink streams its own "sink" samples up to the console.
+    // stream slot, and the receiver streams its own "recv" samples up to the console.
     let counters = Counters::new(sc.threads.max(1) as usize);
     let next_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-    // In multi-file mode the sink also measures what *writing* the received
-    // frames costs. That is the other half of the Gantt's I/O band — the source
-    // cannot know it, so the sink reports it on its own telemetry stream.
+    // In multi-file mode the receiver also measures what *writing* the received
+    // frames costs. That is the other half of the Gantt's I/O band — the sender
+    // cannot know it, so the receiver reports it on its own telemetry stream.
     let frame_ctx = if sc.is_multi_file() {
         let plan = frame::validate(&sc)?;
-        Some((plan.clone(), Arc::new(plan.spec.clone()), frame::FrameCounters::new()))
+        let total = plan.total();
+        Some((
+            plan.clone(),
+            Arc::new(plan.spec.clone()),
+            frame::FrameCounters::new(),
+            frame::Lanes::new(total),
+        ))
     } else {
         None
     };
-    let sink_frames = frame_ctx.as_ref().map(|(_, _, c)| c.clone());
-    super::spawn_sink_sampler_frames(run_id, counters.clone(), stop.clone(), tx, sink_frames);
+    let recv_frames = frame_ctx.as_ref().map(|(_, _, c, _)| c.clone());
+    let recv_lanes = frame_ctx.as_ref().map(|(_, _, _, l)| l.clone());
+    super::spawn_recv_sampler_frames(run_id, counters.clone(), stop.clone(), tx, recv_frames,
+                                     recv_lanes);
 
     let stop2 = stop.clone();
     std::thread::spawn(move || {
@@ -325,7 +377,7 @@ pub async fn run_sink(run_id: String, sc: Scenario, tx: Tx) -> Result<(SocketAdd
                         None => Ok(Box::new(stream)),
                     };
                     if let Ok(io) = io {
-                        sink_conn(io, s, c, ni, fc);
+                        recv_conn(io, s, c, ni, fc);
                     }
                 });
             } else {
@@ -340,26 +392,27 @@ type FrameCtx = (
     Arc<frame::FramePlan>,
     Arc<crate::protocol::FrameSpec>,
     Arc<frame::FrameCounters>,
+    Arc<frame::Lanes>,
 );
 
-fn sink_conn(mut io: Box<dyn SyncIo>, stop: Stop, counters: Arc<Counters>,
+fn recv_conn(mut io: Box<dyn SyncIo>, stop: Stop, counters: Arc<Counters>,
              next_idx: Arc<std::sync::atomic::AtomicUsize>, frame_ctx: Option<FrameCtx>) {
-    let mut role = [0u8; 1];
-    if io.read_exact(&mut role).is_err() {
+    let mut end = [0u8; 1];
+    if io.read_exact(&mut end).is_err() {
         return;
     }
-    if role[0] == ROLE_FRAME {
-        let Some((plan, spec, frames)) = frame_ctx else {
-            // A frame connection arrived but this sink was prepared for a
+    if end[0] == ROLE_FRAME {
+        let Some((plan, spec, frames, lanes)) = frame_ctx else {
+            // A frame connection arrived but this receiver was prepared for a
             // large-file run — the two ends disagree about the scenario.
-            tracing::warn!("frame connection on a sink not configured for multi-file mode");
+            tracing::warn!("frame connection on a receiver not configured for multi-file mode");
             return;
         };
         let idx = next_idx.fetch_add(1, Ordering::Relaxed) % counters.streams.len();
-        frame::sink_frame_worker(spec, plan, frames, counters, idx, io, stop);
+        frame::recv_frame_worker(spec, plan, frames, counters, lanes, idx, io, stop);
         return;
     }
-    match role[0] {
+    match end[0] {
         ROLE_PROBE => {
             let mut buf = [0u8; 8];
             while !stop.load(Ordering::Relaxed) {

@@ -69,6 +69,39 @@
     -fx-padding: 0 0 8 0;
 }
 .section-label { -fx-text-fill: #94a3b8; -fx-font-size: 11px; -fx-font-weight: bold; }
+
+/* Bottom run-status strip. Sits above the window edge with a top rule so it
+   reads as chrome rather than as another panel competing for attention. */
+.status-bar {
+    -fx-background-color: #0c1320;
+    -fx-border-color: #1e293b transparent transparent transparent;
+    -fx-border-width: 1 0 0 0;
+}
+.status-phase {
+    -fx-text-fill: #e2e8f0;
+    -fx-font-size: 12px;
+    -fx-font-weight: bold;
+    -fx-min-width: 116;
+}
+.status-bar .progress-bar {
+    -fx-accent: #5eead4;
+    -fx-indeterminate-bar-length: 80;
+}
+.status-bar .progress-bar > .track {
+    -fx-background-color: #172033;
+    -fx-background-radius: 6;
+    -fx-background-insets: 0;
+    -fx-border-color: transparent;
+    -fx-padding: 0;
+}
+/* Modena sizes the fill through the bar's own padding and insets; without
+   zeroing them the fill collapses to a hairline against a flat track. */
+.status-bar .progress-bar > .bar {
+    -fx-background-color: #5eead4;
+    -fx-background-radius: 6;
+    -fx-background-insets: 0;
+    -fx-padding: 0;
+}
 .value-pill {
     -fx-background-color: #172033;
     -fx-background-radius: 6;
