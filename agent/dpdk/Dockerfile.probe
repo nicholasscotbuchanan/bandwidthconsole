@@ -1,0 +1,10 @@
+# DPDK feasibility probe image.
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      dpdk dpdk-dev libdpdk-dev build-essential pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /probe
+COPY probe.c .
+RUN gcc probe.c -o probe $(pkg-config --cflags --libs libdpdk) && ./probe --version 2>/dev/null; \
+    echo "built"
+ENTRYPOINT ["/probe/probe"]

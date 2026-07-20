@@ -1,0 +1,32 @@
+# bwagent built WITH the real DPDK datapath (--features dpdk).
+#
+# Build:  podman build -t bwagent-dpdk -f agent/Dockerfile.dpdk agent
+#
+# The resulting agent can run UDP+DPDK and QUIC+DPDK over any DPDK PMD. For a
+# hardware-free two-container link we use net_memif (shared-memory PMD): one
+# side role=server, the other role=client, sharing a unix socket via a volume.
+# No hugepages are required (--no-huge) and no NIC needs binding.
+
+FROM rust:1-slim-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      dpdk-dev libdpdk-dev pkg-config build-essential \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+# Dependency layer first for caching.
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY dpdk ./dpdk
+RUN mkdir src && echo "fn main() {}" > src/main.rs \
+    && cargo build --release --features dpdk 2>/dev/null || true
+COPY src ./src
+RUN touch src/main.rs && cargo build --release --features dpdk
+
+FROM debian:bookworm-slim
+# Runtime DPDK libraries. Note: Debian's `dpdk` package is tools/config only and
+# ships NO librte_*.so — those live in the librte-* packages that libdpdk-dev
+# depends on, which is why the dev package is installed here too. Without it the
+# binary dies at startup with "librte_ethdev.so.23: cannot open shared object".
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      dpdk libdpdk-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/bwagent /usr/local/bin/bwagent
+ENTRYPOINT ["/usr/local/bin/bwagent"]

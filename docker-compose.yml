@@ -1,0 +1,107 @@
+# Three containerised bwagent test surfaces.
+#
+#   1. Start the console on your host first:   (cd console && mvn javafx:run)
+#   2. Bring up the agents:                    docker compose up --build
+#
+# Each agent dials the console on the host via host.docker.internal:9077 (the
+# console binds 0.0.0.0). The data plane runs agent-to-agent over the shared
+# `bwnet` network: each advertises its service name, so when the console pairs
+# e.g. edge1 -> edge2, edge1 connects straight to "edge2" over bwnet.
+#
+# Override the console port with BW_CONSOLE_PORT (defaults to 9077).
+
+x-agent: &agent
+  build:
+    context: ./agent
+    dockerfile: Dockerfile
+  image: bwagent:latest
+  networks: [bwnet]
+  # Lets containers resolve the host on both Docker Desktop and Linux.
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  restart: unless-stopped
+
+services:
+  edge1:
+    <<: *agent
+    container_name: bw-edge1
+    command: ["--console", "host.docker.internal:${BW_CONSOLE_PORT:-9077}",
+              "--name", "edge1", "--advertise", "edge1"]
+
+  edge2:
+    <<: *agent
+    container_name: bw-edge2
+    command: ["--console", "host.docker.internal:${BW_CONSOLE_PORT:-9077}",
+              "--name", "edge2", "--advertise", "edge2"]
+
+  edge3:
+    <<: *agent
+    container_name: bw-edge3
+    command: ["--console", "host.docker.internal:${BW_CONSOLE_PORT:-9077}",
+              "--name", "edge3", "--advertise", "edge3"]
+
+  # --- Real DPDK agents (opt-in: `docker compose --profile dpdk up`) ---
+  #
+  # These run the kernel-bypass datapath for UDP+DPDK and QUIC+DPDK. They are
+  # linked by DPDK's net_memif shared-memory PMD — a genuine DPDK-to-DPDK link
+  # needing no NIC, no hugepages (--no-huge) and no vfio binding. One side is
+  # the memif server, the other the client; they share the socket via a volume.
+  # Brought up by `./run-demo.sh --dpdk`, or directly:
+  #   docker compose --profile dpdk up --build
+  dpdk-sink:
+    build:
+      context: ./agent
+      dockerfile: Dockerfile.dpdk
+    image: bwagent-dpdk:latest
+    container_name: bw-dpdk-sink
+    networks: [bwnet]
+    privileged: true          # EAL needs mmap/shm privileges
+    volumes: ["memifsock:/run/memif"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    command: ["--console", "host.docker.internal:${BW_CONSOLE_PORT:-9077}",
+              "--name", "dpdk-sink", "--advertise", "dpdk-sink",
+              "--dpdk-ip", "10.99.0.2",
+              "--dpdk-eal", "bwagent -l 1 --no-huge -m 256 --no-pci --file-prefix=sink --vdev=net_memif0,role=server,id=0,bsize=16384,socket=/run/memif/memif.sock,socket-abstract=no"]
+
+  dpdk-src:
+    build:
+      context: ./agent
+      dockerfile: Dockerfile.dpdk
+    image: bwagent-dpdk:latest
+    container_name: bw-dpdk-src
+    networks: [bwnet]
+    privileged: true
+    volumes: ["memifsock:/run/memif"]
+    depends_on: [dpdk-sink]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    command: ["--console", "host.docker.internal:${BW_CONSOLE_PORT:-9077}",
+              "--name", "dpdk-src", "--advertise", "dpdk-src",
+              "--dpdk-ip", "10.99.0.1",
+              "--dpdk-eal", "bwagent -l 0 --no-huge -m 256 --no-pci --file-prefix=src --vdev=net_memif0,role=client,id=0,bsize=16384,socket=/run/memif/memif.sock,socket-abstract=no"]
+
+  # Optional persistence for runs + Past Runs replay. Point the console at it:
+  #   export BW_INFLUX_URL=http://localhost:8086
+  #   export BW_INFLUX_TOKEN=bwtest-token BW_INFLUX_ORG=bwtest BW_INFLUX_BUCKET=bwtest
+  influxdb:
+    image: influxdb:2.7
+    container_name: bw-influx
+    networks: [bwnet]
+    ports: ["8086:8086"]
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: bwtest
+      DOCKER_INFLUXDB_INIT_PASSWORD: bwtest-password
+      DOCKER_INFLUXDB_INIT_ORG: bwtest
+      DOCKER_INFLUXDB_INIT_BUCKET: bwtest
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: bwtest-token
+    volumes:
+      - influx-data:/var/lib/influxdb2
+    restart: unless-stopped
+
+volumes:
+  influx-data:
+  memifsock:
+
+networks:
+  bwnet:
+    driver: bridge

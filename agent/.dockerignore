@@ -1,0 +1,8 @@
+# The local cargo build dir is ~1.8GB and is rebuilt inside the image anyway —
+# shipping it as build context wastes disk and time on every one of the demo's
+# container builds (and can exhaust a podman/docker VM's disk outright).
+target/
+
+# Nothing else here is needed to build the agent.
+.git/
+*.md

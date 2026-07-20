@@ -1,0 +1,5 @@
+agent/target/
+console/target/
+console/dependency-reduced-pom.xml
+*.log
+.DS_Store
