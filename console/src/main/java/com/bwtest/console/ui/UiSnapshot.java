@@ -37,7 +37,10 @@ public class UiSnapshot extends Application {
     @Override
     public void start(Stage stage) throws Exception {
         Orchestrator orch = new Orchestrator();
-        seed(orch);
+        // BW_UI_EMPTY renders the cold-start console — no agents, no runs. That
+        // is what a user actually meets first, and every empty state has to earn
+        // its place there, so it needs looking at as much as the seeded view.
+        if (System.getenv("BW_UI_EMPTY") == null) seed(orch);
 
         ObjectProperty<RunRecord> selected = new SimpleObjectProperty<>();
         ConsoleUI ui = new ConsoleUI(orch, 9077, selected);

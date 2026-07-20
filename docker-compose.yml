@@ -58,6 +58,12 @@ services:
     privileged: true          # EAL needs mmap/shm privileges
     volumes: ["memifsock:/run/memif"]
     extra_hosts: ["host.docker.internal:host-gateway"]
+    # The socket lives in a named volume that outlives the container, and memif
+    # cannot rebind over a stale inode ("Address already in use" -> DPDK start
+    # fails). Clear it before the server binds, or every run after the first
+    # dies. Only the server (this side) creates the socket.
+    entrypoint: ["/bin/sh", "-c",
+                 "rm -f /run/memif/memif.sock; exec /usr/local/bin/bwagent \"$@\"", "sh"]
     command: ["--console", "host.docker.internal:${BW_CONSOLE_PORT:-9077}",
               "--name", "dpdk-sink", "--advertise", "dpdk-sink",
               "--dpdk-ip", "10.99.0.2",

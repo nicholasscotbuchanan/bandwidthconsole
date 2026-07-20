@@ -13,10 +13,10 @@ package com.bwtest.console.model;
 public enum TransferMode {
     /** One continuous byte stream. The original behaviour, and what DVS
      *  frametest calls streaming mode ({@code -s}). */
-    LARGE_FILE("LargeFile", "Large file"),
+    LARGE_FILE("LargeFile", "Large file — one stream"),
     /** Discrete frames, each paying open/IO/close on both ends, paced against an
      *  fps deadline with frametest's queue-depth drop accounting. */
-    MULTI_FILE("MultiFile", "Multi-file (frames)");
+    MULTI_FILE("MultiFile", "Multi-file — frametest");
 
     public final String wire;
     public final String label;

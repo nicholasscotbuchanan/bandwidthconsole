@@ -91,13 +91,7 @@ public class FrameIoView extends Region {
 
         RunRecord r = selected.get();
         if (r == null || !r.scenario.isMultiFile()) {
-            g.setFill(MUTED);
-            g.setFont(Font.font(12));
-            g.fillText(r == null
-                            ? "Select a run to see its frame timings."
-                            : "This run sent one large stream. Switch Sending to "
-                              + "\"Multi-file (frames)\" to measure per-frame cost.",
-                    16, 52);
+            drawIntro(g, r != null, w);
             return;
         }
 
@@ -125,6 +119,91 @@ public class FrameIoView extends Region {
         y = drawFpsPanel(g, r, 16, y, w - 32, Math.max(70, charts * 0.46));
         y = drawHistogram(g, fs, 16, y + GAP, w - 32, Math.max(70, charts * 0.54 - 46));
         drawStagePanel(g, fs, r, 16, y + GAP, w - 32);
+    }
+
+    /**
+     * The empty state, which is the first thing most people meet here. It has to
+     * do real work: say what the tab measures, name the tool the semantics come
+     * from, and give the exact steps to produce data — an empty panel that only
+     * says "select a run" leaves the whole feature undiscoverable.
+     */
+    private void drawIntro(GraphicsContext g, boolean largeFileRunSelected, double w) {
+        double x = 16, y = 54;
+
+        g.setFill(LABEL);
+        g.setFont(Font.font(12));
+        y = wrap(g, largeFileRunSelected
+                ? "The selected run sent one continuous stream, so it has no per-frame "
+                  + "timings. This tab measures the other case:"
+                : "This tab measures what it costs to move thousands of discrete frame "
+                  + "files instead of one continuous stream —", x, y, w - 32, 17);
+        y = wrap(g, "per-frame open / transfer / close, frame rate against a target "
+                + "deadline, and frames dropped for missing it. The semantics are DVS "
+                + "frametest's, so the numbers compare directly with it.", x, y, w - 32, 17);
+
+        y += 16;
+        g.setFill(HEAD);
+        g.setFont(Font.font("System", FontWeight.BOLD, 10));
+        g.fillText("TO FILL THIS TAB", x, y);
+        y += 20;
+
+        String[] steps = {
+                "1.   Set  Sending → \"Multi-file — frametest\"  in the run panel.",
+                "2.   Pick a frame size and count — 4K is 51,052,544 B, matching frametest's -w 4k.",
+                "3.   Optionally set a target fps and queue depth to enable drop accounting.",
+                "4.   Run. Compare against the same scenario in Large file mode to see the cost.",
+        };
+        g.setFont(Font.font(12));
+        for (String s : steps) {
+            g.setFill(TEXT);
+            g.fillText(s, x + 4, y);
+            y += 21;
+        }
+
+        y += 14;
+        g.setFill(HEAD);
+        g.setFont(Font.font("System", FontWeight.BOLD, 10));
+        g.fillText("ALSO ON THE COMMAND LINE", x, y);
+        y += 20;
+        g.setFill(MUTED);
+        g.setFont(Font.font(12));
+        y = wrap(g, "Existing frametest command lines run as-is against a local path, "
+                + "with the original report format:", x, y, w - 32, 17);
+        y += 4;
+        g.setFill(C_IO);
+        g.setFont(Font.font("Menlo", 12));
+        g.fillText("bwagent frametest -w 4k -n 3000 -t 4 /mnt/san/TEST", x + 4, y);
+
+        // The Gantt carries the other half of the answer, so point at it.
+        y += 30;
+        g.setFill(MUTED);
+        g.setFont(Font.font(12));
+        wrap(g, "The Latency Gantt tab splits each frame into source disk → network → "
+                + "sink disk, which is where you see whether the storage or the wire is "
+                + "costing you the throughput.", x, y, w - 32, 17);
+    }
+
+    /** Draw wrapped text, returning the y just past the last line. */
+    private double wrap(GraphicsContext g, String text, double x, double y,
+                        double maxW, double lineH) {
+        // Rough advance for the 12px UI font; exact metrics would need a Text
+        // node measure pass, and this only has to avoid running off the panel.
+        int perLine = Math.max(20, (int) (maxW / 6.4));
+        StringBuilder line = new StringBuilder();
+        for (String word : text.split(" ")) {
+            if (line.length() + word.length() + 1 > perLine) {
+                g.fillText(line.toString(), x, y);
+                y += lineH;
+                line.setLength(0);
+            }
+            if (line.length() > 0) line.append(' ');
+            line.append(word);
+        }
+        if (line.length() > 0) {
+            g.fillText(line.toString(), x, y);
+            y += lineH;
+        }
+        return y;
     }
 
     /**
