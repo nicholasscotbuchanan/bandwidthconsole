@@ -61,10 +61,10 @@ deb_out=$("$ENGINE" run --rm --platform "linux/$ARCH" -v "$DIST_DIR:/pkg:ro" deb
 set -e
 $DESKTOP_SETUP
 apt-get -qq update >/dev/null 2>&1
-apt-get -qq install -y /pkg/bwconsole_*_${DEB_ARCH}.deb >/dev/null 2>&1 && echo 'INSTALL_CONSOLE ok'
-apt-get -qq install -y /pkg/bwagent_*_${DEB_ARCH}.deb  >/dev/null 2>&1 && echo 'INSTALL_AGENT ok'
-/opt/bwconsole/lib/app/bwagent --version >/dev/null 2>&1 && echo 'BUNDLED_AGENT ok'
-/usr/bin/bwagent --version >/dev/null 2>&1 && echo 'STANDALONE_AGENT ok'
+apt-get install -y /pkg/bwconsole_*_${DEB_ARCH}.deb >/tmp/ic.log 2>&1 && echo 'INSTALL_CONSOLE ok' || { echo '--- INSTALL_CONSOLE failed ---'; tail -25 /tmp/ic.log; }
+apt-get install -y /pkg/bwagent_*_${DEB_ARCH}.deb  >/tmp/ia.log 2>&1 && echo 'INSTALL_AGENT ok' || { echo '--- INSTALL_AGENT failed ---'; tail -25 /tmp/ia.log; }
+/opt/bwconsole/lib/app/bwagent --version >/tmp/ba.log 2>&1 && echo 'BUNDLED_AGENT ok' || { echo '--- BUNDLED_AGENT failed ---'; tail -5 /tmp/ba.log; }
+/usr/bin/bwagent --version >/tmp/sa.log 2>&1 && echo 'STANDALONE_AGENT ok' || { echo '--- STANDALONE_AGENT failed ---'; tail -5 /tmp/sa.log; }
 grep -q 'java.net.http' /opt/bwconsole/lib/runtime/release && echo 'MODULE_HTTP ok'
 grep -q 'javafx.controls' /opt/bwconsole/lib/runtime/release && echo 'MODULE_JAVAFX ok'
 # The app must carry its own JVM and never look for a system one. This image
@@ -87,10 +87,10 @@ echo "-- rockylinux:9 (rpm)"
 rpm_out=$("$ENGINE" run --rm --platform "linux/$ARCH" -v "$DIST_DIR:/pkg:ro" rockylinux/rockylinux:9 bash -c "
 set -e
 $DESKTOP_SETUP
-dnf -q -y install /pkg/bwconsole-*.${RPM_ARCH}.rpm >/dev/null 2>&1 && echo 'INSTALL_CONSOLE ok'
-dnf -q -y install /pkg/bwagent-*.${RPM_ARCH}.rpm  >/dev/null 2>&1 && echo 'INSTALL_AGENT ok'
-/opt/bwconsole/lib/app/bwagent --version >/dev/null 2>&1 && echo 'BUNDLED_AGENT ok'
-/usr/bin/bwagent --version >/dev/null 2>&1 && echo 'STANDALONE_AGENT ok'
+dnf -y install /pkg/bwconsole-*.${RPM_ARCH}.rpm >/tmp/ic.log 2>&1 && echo 'INSTALL_CONSOLE ok' || { echo '--- INSTALL_CONSOLE failed ---'; tail -25 /tmp/ic.log; }
+dnf -y install /pkg/bwagent-*.${RPM_ARCH}.rpm  >/tmp/ia.log 2>&1 && echo 'INSTALL_AGENT ok' || { echo '--- INSTALL_AGENT failed ---'; tail -25 /tmp/ia.log; }
+/opt/bwconsole/lib/app/bwagent --version >/tmp/ba.log 2>&1 && echo 'BUNDLED_AGENT ok' || { echo '--- BUNDLED_AGENT failed ---'; tail -5 /tmp/ba.log; }
+/usr/bin/bwagent --version >/tmp/sa.log 2>&1 && echo 'STANDALONE_AGENT ok' || { echo '--- STANDALONE_AGENT failed ---'; tail -5 /tmp/sa.log; }
 grep -q 'java.net.http' /opt/bwconsole/lib/runtime/release && echo 'MODULE_HTTP ok'
 # Test -f first: 'ldd missing-file | grep -q not-found' fails the grep and
 # would report a pass for a launcher that was never installed.

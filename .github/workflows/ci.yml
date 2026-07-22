@@ -66,8 +66,11 @@ jobs:
       - name: show configuration
         run: make help
 
+      # ALLOW_HOST_GLIBC: this job compiles and tests, it does not ship a binary,
+      # so linking against the runner's glibc is fine and saves installing the
+      # zig toolchain twice. The package job, which does ship, enforces the floor.
       - name: make
-        run: make
+        run: make ALLOW_HOST_GLIBC=1
 
       - name: make check
         run: make check
@@ -99,8 +102,9 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('agent/Cargo.lock', 'agent/Cargo.toml') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      # ALLOW_HOST_GLIBC: the smoke agent runs on this runner and nowhere else.
       - name: configure & build agent
-        run: ./configure && make agent
+        run: ./configure && make agent ALLOW_HOST_GLIBC=1
 
       # mock_console.py drives a genuine run between two agents and exits
       # non-zero unless it sees telemetry and a well-formed summary.
@@ -194,8 +198,34 @@ jobs:
           sudo dpkg -i /tmp/nfpm.deb
           nfpm --version
 
+      # Without this the agent links against the runner's glibc (2.39 on
+      # ubuntu-24.04) and will not start on debian 12 (2.36) or rocky 9 (2.34) —
+      # it installs perfectly and dies on exec. configure detects zig +
+      # cargo-zigbuild and pins the floor to 2.28; check-glibc-floor fails the
+      # build if that detection did not happen, so this step going missing is
+      # now a loud error rather than a broken package.
+      - name: Set up zig + cargo-zigbuild (glibc floor)
+        run: |
+          set -euo pipefail
+          zig=0.13.0
+          curl -fsSL -o /tmp/zig.tar.xz \
+            "https://ziglang.org/download/${zig}/zig-linux-x86_64-${zig}.tar.xz"
+          sudo tar -xf /tmp/zig.tar.xz -C /opt
+          echo "/opt/zig-linux-x86_64-${zig}" >> "$GITHUB_PATH"
+          # Pinned: cargo-zigbuild tracks zig's frequent breaking changes, so an
+          # unpinned install eventually stops matching the zig pinned above.
+          cargo install cargo-zigbuild --locked --version '^0.19'
+
       - name: configure
         run: ./configure --with-javafx-jmods="$JMODS"
+
+      # Surfaced on its own: if configure did not pick up zigbuild, that is the
+      # single most useful line in the log when packages later fail to start.
+      - name: confirm glibc floor is pinned
+        run: |
+          zig version
+          cargo zigbuild --version
+          grep -E 'HAVE_ZIGBUILD|GLIBC_FLOOR' config.mk
 
       - name: build deb and rpm
         run: make packages

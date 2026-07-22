@@ -119,21 +119,39 @@ $(CONSOLE_JAR): $(shell find $(CONSOLE_DIR)/src -type f 2>/dev/null) $(CONSOLE_D
 agent:
 	@echo "  CARGO    build --release"
 	@cd $(AGENT_DIR) && $(AGENT_BUILD)
-ifeq ($(HAVE_ZIGBUILD),yes)
 	@$(MAKE) -s check-glibc-floor
-endif
 
 # Fails the build if the agent needs a newer glibc than configured. Cheap, and
 # it catches a silent fallback to a native build before a package ships.
+#
+# This deliberately runs whether or not cargo-zigbuild is present. It used to be
+# gated behind HAVE_ZIGBUILD=yes, which inverted its purpose: the check was
+# skipped in exactly the case that produces an over-linked binary. Building on
+# a modern host without zigbuild silently yielded an agent needing GLIBC_2.39,
+# and nothing said so until it failed to start on debian 12 and rocky 9 — after
+# packaging, in a container, with no error text.
+#
+# Set ALLOW_HOST_GLIBC=1 to build against the host glibc on purpose (a local
+# dev build you have no intention of packaging).
 .PHONY: check-glibc-floor
 check-glibc-floor:
 	@if command -v objdump >/dev/null 2>&1; then \
 	  max=$$(objdump -T $(AGENT_BIN) 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1); \
 	  if [ -n "$$max" ]; then \
 	    if [ "$$(printf '%s\nGLIBC_$(GLIBC_FLOOR)\n' $$max | sort -V | tail -1)" != "GLIBC_$(GLIBC_FLOOR)" ]; then \
-	      echo "$(AGENT_BIN): requires $$max, above the GLIBC_$(GLIBC_FLOOR) floor" >&2; exit 1; \
+	      if [ -n "$(ALLOW_HOST_GLIBC)" ]; then \
+	        echo "  WARN     agent requires $$max, above the GLIBC_$(GLIBC_FLOOR) floor (ALLOW_HOST_GLIBC set)"; \
+	      else \
+	        echo "$(AGENT_BIN): requires $$max, above the GLIBC_$(GLIBC_FLOOR) floor." >&2; \
+	        echo "This binary will not start on distros older than the build host." >&2; \
+	        echo "  install cargo-zigbuild + zig, then re-run ./configure   (pins the floor)" >&2; \
+	        echo "  or lower the floor:   ./configure --with-glibc-floor=$${max#GLIBC_}" >&2; \
+	        echo "  or accept host glibc: make agent ALLOW_HOST_GLIBC=1" >&2; \
+	        exit 1; \
+	      fi; \
+	    else \
+	      echo "  CHECK    agent requires at most $$max"; \
 	    fi; \
-	    echo "  CHECK    agent requires at most $$max"; \
 	  fi; \
 	fi
 
