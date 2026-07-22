@@ -182,9 +182,17 @@ jobs:
       # single most useful line in the log when packages later fail to start.
       - name: confirm glibc floor is pinned
         run: |
+          set -euo pipefail
           zig version
-          cargo zigbuild --version
+          # cargo-zigbuild, not `cargo zigbuild`: --version on the subcommand is
+          # forwarded to it and rejected.
+          cargo-zigbuild --version
           grep -E 'HAVE_ZIGBUILD|GLIBC_FLOOR' config.mk
+          # Assert rather than print. configure degrades to a native build with
+          # only a log line if it cannot find the toolchain, which is how the
+          # over-linked agent shipped in the first place.
+          grep -Eq '^HAVE_ZIGBUILD[[:space:]]*=[[:space:]]*yes' config.mk \
+            || { echo "::error::configure did not detect cargo-zigbuild; agent would link against host glibc"; exit 1; }
 
       - name: build deb and rpm
         run: make packages
