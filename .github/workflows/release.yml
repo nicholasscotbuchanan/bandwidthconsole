@@ -1,0 +1,221 @@
+name: Release
+
+# Cutting a release is one command: push a v* tag. Everything below runs from
+# that tag and nothing else — no manual uploads, no artifacts built on whoever's
+# laptop happened to be free.
+#
+# The reason this must run on CI rather than locally is architecture. jpackage
+# cannot cross-compile, and the Makefile flatly refuses to build amd64 packages
+# on an arm64 host because rustc segfaults under qemu-user emulation. A release
+# cut from an Apple Silicon machine would therefore be arm64-only, which is the
+# wrong half of the userbase. GitHub's ubuntu runners are x86_64.
+#
+#   git tag -a v1.2.3 -m 'bwtest 1.2.3' && git push origin v1.2.3
+#
+# workflow_dispatch is a dry run: it builds and verifies everything, then stops
+# short of publishing, so the release path can be exercised without a tag.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # A tag that disagrees with the tree is the classic release bug: v1.1.0 cut
+  # from a tree still saying 1.0.0 produces packages named after the old version
+  # and a release nobody can correlate to anything. Catch it in 10 seconds
+  # rather than after the 25-minute package job.
+  preflight:
+    name: tag matches tree
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve and compare versions
+        id: v
+        run: |
+          set -euo pipefail
+          # configure reads the pom the same way; keep the two in agreement.
+          pom=$(sed -n 's|.*<version>\(.*\)</version>.*|\1|p' console/pom.xml | head -1)
+          cargo=$(sed -n 's|^version = "\(.*\)"|\1|p' agent/Cargo.toml | head -1)
+          echo "pom.xml:    $pom"
+          echo "Cargo.toml: $cargo"
+
+          if [ "$pom" != "$cargo" ]; then
+            echo "::error::console/pom.xml ($pom) and agent/Cargo.toml ($cargo) disagree"
+            exit 1
+          fi
+
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            if [ "$tag" != "$pom" ]; then
+              echo "::error::tag v$tag does not match tree version $pom — retag or bump the tree"
+              exit 1
+            fi
+            echo "tag v$tag matches the tree"
+          else
+            echo "dry run: no tag to check against"
+          fi
+
+          echo "version=$pom" >> "$GITHUB_OUTPUT"
+
+  # The tag may point at a commit CI never saw (a tag on an older commit, or
+  # pushed alongside the branch push and racing it). Re-run the build and the
+  # test suite here so publishing is never the first time this tree was built.
+  check:
+    name: build & test
+    needs: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            agent/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('agent/Cargo.lock', 'agent/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: configure
+        run: ./configure
+
+      - name: make
+        run: make
+
+      - name: make check
+        run: make check
+
+  # Same recipe as ci.yml's package job. It is duplicated rather than shared
+  # because a release must be reproducible from the tag alone: a reusable
+  # workflow referenced by @main would let a later edit change what an old tag
+  # builds. If you change one, change both.
+  package:
+    name: linux packages (amd64) + source tarball
+    needs: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            agent/target
+          key: ${{ runner.os }}-cargo-pkg-${{ hashFiles('agent/Cargo.lock', 'agent/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-pkg-
+
+      # jpackage needs the jmods bundle, not the SDK.
+      - name: Fetch JavaFX jmods
+        run: |
+          set -euo pipefail
+          ver=23.0.1
+          url="https://download2.gluonhq.com/openjfx/${ver}/openjfx-${ver}_linux-x64_bin-jmods.zip"
+          curl -fsSL -o /tmp/jmods.zip "$url"
+          mkdir -p "$HOME/javafx"
+          unzip -q /tmp/jmods.zip -d "$HOME/javafx"
+          echo "JMODS=$HOME/javafx/javafx-jmods-${ver}" >> "$GITHUB_ENV"
+
+      # rpmbuild is not on the runner, and without it `make rpm` fails at the
+      # very last step after doing all the work.
+      - name: Native package tooling
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq rpm fakeroot
+
+      - name: nfpm (agent .deb/.rpm)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/nfpm.deb \
+            https://github.com/goreleaser/nfpm/releases/download/v2.41.1/nfpm_2.41.1_amd64.deb
+          sudo dpkg -i /tmp/nfpm.deb
+          nfpm --version
+
+      - name: configure
+        run: ./configure --with-javafx-jmods="$JMODS"
+
+      - name: build deb and rpm
+        run: make packages
+
+      # Source tarball is built from the same configured tree, so its version
+      # cannot drift from the packages sitting beside it in the release.
+      - name: source tarball
+        run: make dist
+
+      # jpackage exiting 0 proves nothing — every serious packaging bug found on
+      # this project produced a package that installed perfectly and failed only
+      # once running. This installs them into clean distro containers and starts
+      # them. Bounded because verify-linux.sh has no internal timeout and an
+      # unreachable container engine blocks on a socket read forever.
+      - name: verify packages in clean distro containers
+        timeout-minutes: 25
+        run: make verify
+
+      - name: collect release assets
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          cp packaging/dist/* release/
+          cp bwtest-${{ needs.preflight.outputs.version }}.tar.gz release/
+          cd release
+          sha256sum * > SHA256SUMS
+          ls -la
+          cat SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: release/*
+          if-no-files-found: error
+
+  publish:
+    name: publish GitHub release
+    needs: [preflight, check, package]
+    # Dry runs stop here: everything above has proven the release builds and the
+    # packages run, without creating anything public.
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # --generate-notes needs history to diff against
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release
+
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --title "bwtest ${{ needs.preflight.outputs.version }}" \
+            --generate-notes \
+            release/*
