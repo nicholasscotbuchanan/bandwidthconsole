@@ -115,87 +115,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '21'
-          cache: maven
+      # Packages are built inside packaging/docker/Dockerfile.linux, not on the
+      # runner directly, and for the same reason the Makefile does it: the base
+      # host leaks into the packages. Two host-specific bugs both trace to
+      # building on a bleeding-edge runner and both are fixed by the image —
+      #
+      #   * glibc floor: a native build on ubuntu-24.04 needs GLIBC_2.39 and
+      #     will not start on debian 12 (2.36) or rocky 9 (2.34). The image
+      #     carries zig + cargo-zigbuild and pins the floor to 2.28.
+      #   * .deb Depends: jpackage derives the dependency list from the build
+      #     host, so on noble it stamps libasound2t64 — a name debian 12 cannot
+      #     resolve. The image is jammy (22.04), whose libasound2 the t64
+      #     packages still Provide, so the .deb installs on both.
+      #
+      # The image also carries maven, the JDK, nfpm and the rpm toolchain, so
+      # none of that is installed on the runner. This is the exact path a
+      # maintainer's local `make deb` takes — CI and a laptop build the same way.
+      #
+      # docker ships on the runner. --disable-console/--disable-agent let the
+      # host ./configure succeed without a JDK, maven or cargo present: nothing
+      # compiles on the host, and the container re-runs ./configure internally
+      # with everything enabled. config.mk here supplies only CONTAINER_ENGINE
+      # and HOST_ARCH, which is all container-pkg reads.
+      - name: configure (container build)
+        run: ./configure --with-container-engine=docker --disable-console --disable-agent
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            agent/target
-          key: ${{ runner.os }}-cargo-pkg-${{ hashFiles('agent/Cargo.lock', 'agent/Cargo.toml') }}
-          restore-keys: ${{ runner.os }}-cargo-pkg-
-
-      # jpackage needs the jmods bundle, not the SDK.
-      - name: Fetch JavaFX jmods
+      - name: build deb and rpm in the pinned image
         run: |
-          set -euo pipefail
-          ver=23.0.1
-          url="https://download2.gluonhq.com/openjfx/${ver}/openjfx-${ver}_linux-x64_bin-jmods.zip"
-          curl -fsSL -o /tmp/jmods.zip "$url"
-          mkdir -p "$HOME/javafx"
-          unzip -q /tmp/jmods.zip -d "$HOME/javafx"
-          echo "JMODS=$HOME/javafx/javafx-jmods-${ver}" >> "$GITHUB_ENV"
-
-      # rpmbuild is not on the runner, and without it `make rpm` fails at the
-      # very last step after doing all the work.
-      - name: Native package tooling
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq rpm fakeroot
-
-      - name: nfpm (agent .deb/.rpm)
-        run: |
-          set -euo pipefail
-          curl -fsSL -o /tmp/nfpm.deb \
-            https://github.com/goreleaser/nfpm/releases/download/v2.41.1/nfpm_2.41.1_amd64.deb
-          sudo dpkg -i /tmp/nfpm.deb
-          nfpm --version
-
-      # Without this the agent links against the runner's glibc (2.39 on
-      # ubuntu-24.04) and will not start on debian 12 (2.36) or rocky 9 (2.34) —
-      # it installs perfectly and dies on exec. configure detects zig +
-      # cargo-zigbuild and pins the floor to 2.28; check-glibc-floor fails the
-      # build if that detection did not happen, so this step going missing is
-      # now a loud error rather than a broken package.
-      - name: Set up zig + cargo-zigbuild (glibc floor)
-        run: |
-          set -euo pipefail
-          zig=0.13.0
-          curl -fsSL -o /tmp/zig.tar.xz \
-            "https://ziglang.org/download/${zig}/zig-linux-x86_64-${zig}.tar.xz"
-          sudo tar -xf /tmp/zig.tar.xz -C /opt
-          echo "/opt/zig-linux-x86_64-${zig}" >> "$GITHUB_PATH"
-          # Pinned: cargo-zigbuild tracks zig's frequent breaking changes, so an
-          # unpinned install eventually stops matching the zig pinned above.
-          cargo install cargo-zigbuild --locked --version '^0.19'
-
-      - name: configure
-        run: ./configure --with-javafx-jmods="$JMODS"
-
-      # Surfaced on its own: if configure did not pick up zigbuild, that is the
-      # single most useful line in the log when packages later fail to start.
-      - name: confirm glibc floor is pinned
-        run: |
-          set -euo pipefail
-          zig version
-          # cargo-zigbuild, not `cargo zigbuild`: --version on the subcommand is
-          # forwarded to it and rejected.
-          cargo-zigbuild --version
-          grep -E 'HAVE_ZIGBUILD|GLIBC_FLOOR' config.mk
-          # Assert rather than print. configure degrades to a native build with
-          # only a log line if it cannot find the toolchain, which is how the
-          # over-linked agent shipped in the first place.
-          grep -Eq '^HAVE_ZIGBUILD[[:space:]]*=[[:space:]]*yes' config.mk \
-            || { echo "::error::configure did not detect cargo-zigbuild; agent would link against host glibc"; exit 1; }
-
-      - name: build deb and rpm
-        run: make packages
+          make container-pkg PKG_TYPE=deb
+          make container-pkg PKG_TYPE=rpm
+          ls -la packaging/dist
 
       # Source tarball is built from the same configured tree, so its version
       # cannot drift from the packages sitting beside it in the release.
