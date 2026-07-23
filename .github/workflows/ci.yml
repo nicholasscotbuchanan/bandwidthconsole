@@ -186,6 +186,12 @@ jobs:
           make container-pkg PKG_TYPE=rpm
           ls -la packaging/dist
 
+      # The container runs as root and leaves build/, the two target/ dirs and
+      # packaging/dist owned by root, which the host-user steps below then
+      # cannot touch. Hand the tree back to the job user.
+      - name: reclaim container-written files
+        run: sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
+
       # A Makefile-behaviour regression test, independent of the build path
       # above: agent-pkg must error when nfpm is absent rather than reporting
       # success having produced no agent package. nfpm lives only in the image,

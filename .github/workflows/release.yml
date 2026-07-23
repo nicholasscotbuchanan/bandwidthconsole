@@ -147,6 +147,12 @@ jobs:
           make container-pkg PKG_TYPE=rpm
           ls -la packaging/dist
 
+      # The container runs as root and leaves build/, the two target/ dirs and
+      # packaging/dist owned by root, which the host-user steps below (make dist
+      # writes build/) then cannot touch. Hand the tree back to the job user.
+      - name: reclaim container-written files
+        run: sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
+
       # Source tarball is built from the same configured tree, so its version
       # cannot drift from the packages sitting beside it in the release.
       - name: source tarball
