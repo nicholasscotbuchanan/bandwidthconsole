@@ -171,13 +171,14 @@ jobs:
       # none of that is installed on the runner. This is the exact path a
       # maintainer's local `make deb` takes — CI and a laptop build the same way.
       #
-      # docker ships on the runner. --disable-console/--disable-agent let the
-      # host ./configure succeed without a JDK, maven or cargo present: nothing
-      # compiles on the host, and the container re-runs ./configure internally
-      # with everything enabled. config.mk here supplies only CONTAINER_ENGINE
-      # and HOST_ARCH, which is all container-pkg reads.
+      # docker ships on the runner, as do maven, a JDK and cargo, so the host
+      # ./configure succeeds with nothing installed. Its config.mk supplies only
+      # CONTAINER_ENGINE and HOST_ARCH — all container-pkg reads — and nothing
+      # compiles on the host: the container re-runs ./configure internally and
+      # does the real build. (configure refuses --disable of both components, so
+      # they are left enabled; it makes no difference to a container build.)
       - name: configure (container build)
-        run: ./configure --with-container-engine=docker --disable-console --disable-agent
+        run: ./configure --with-container-engine=docker
 
       - name: build deb and rpm in the pinned image
         run: |
